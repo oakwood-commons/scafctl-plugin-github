@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/oakwood-commons/httpc"
+	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1527,4 +1528,103 @@ func TestProvider_WriteOperations_CoverAllOperations(t *testing.T) {
 		assert.False(t, isRead && isWrite,
 			"operation %q is classified as both read and write", op)
 	}
+}
+
+// ─── ConfigureProvider Tests ─────────────────────────────────────────────────
+
+func TestConfigureProvider_UnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	p := NewPlugin()
+	err := p.ConfigureProvider(context.Background(), "unknown", sdkplugin.ProviderConfig{})
+	assert.ErrorContains(t, err, "unknown provider")
+}
+
+func TestConfigureProvider_NoSettings(t *testing.T) {
+	t.Parallel()
+
+	p := NewPlugin()
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{})
+	require.NoError(t, err)
+	assert.False(t, p.provider.allowPrivateIPs)
+}
+
+func TestConfigureProvider_AllowPrivateIPs(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(map[string]any{"allowPrivateIPs": true})
+	require.NoError(t, err)
+	cfg := sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"httpClient": raw,
+		},
+	}
+
+	p := NewPlugin()
+	err = p.ConfigureProvider(context.Background(), ProviderName, cfg)
+	require.NoError(t, err)
+	assert.True(t, p.provider.allowPrivateIPs)
+}
+
+func TestConfigureProvider_DisallowPrivateIPs(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(map[string]any{"allowPrivateIPs": false})
+	require.NoError(t, err)
+	cfg := sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"httpClient": raw,
+		},
+	}
+
+	p := NewPlugin()
+	p.provider.allowPrivateIPs = true // pre-set to true; config should override
+	err = p.ConfigureProvider(context.Background(), ProviderName, cfg)
+	require.NoError(t, err)
+	assert.False(t, p.provider.allowPrivateIPs)
+}
+
+func TestConfigureProvider_MalformedHttpClientSettings(t *testing.T) {
+	t.Parallel()
+
+	cfg := sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{
+			"httpClient": json.RawMessage(`not-valid-json`),
+		},
+	}
+
+	p := NewPlugin()
+	err := p.ConfigureProvider(context.Background(), ProviderName, cfg)
+	assert.ErrorContains(t, err, "unmarshal httpClient settings")
+}
+
+func TestConfigureProvider_ResetsAllowPrivateIPsOnSubsequentCall(t *testing.T) {
+	t.Parallel()
+
+	// First call enables allowPrivateIPs.
+	raw, err := json.Marshal(map[string]any{"allowPrivateIPs": true})
+	require.NoError(t, err)
+	p := NewPlugin()
+	err = p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{
+		Settings: map[string]json.RawMessage{"httpClient": raw},
+	})
+	require.NoError(t, err)
+	assert.True(t, p.provider.allowPrivateIPs)
+
+	// Second call omits the httpClient block entirely; allowPrivateIPs should revert to false.
+	err = p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{})
+	require.NoError(t, err)
+	assert.False(t, p.provider.allowPrivateIPs)
+}
+
+func TestConfigureProvider_InvalidatesCachedClient(t *testing.T) {
+	t.Parallel()
+
+	p := NewPlugin()
+	// Simulate a previously cached client.
+	p.provider.client = httpc.NewClient(&httpc.ClientConfig{})
+
+	err := p.ConfigureProvider(context.Background(), ProviderName, sdkplugin.ProviderConfig{})
+	require.NoError(t, err)
+	assert.Nil(t, p.provider.client, "ConfigureProvider should clear the cached client")
 }
