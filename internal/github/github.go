@@ -134,6 +134,9 @@ type Provider struct {
 	// client can be overridden for testing via WithClient option.
 	client *httpc.Client
 
+	// allowPrivateIPs is set by ConfigureProvider from host settings.
+	allowPrivateIPs bool
+
 	// Retry configuration -- overridable for testing.
 	commitMaxAttempts    int
 	commitRetryBackoff   time.Duration
@@ -291,10 +294,30 @@ func (p *Plugin) GetProviderDescriptor(_ context.Context, providerName string) (
 }
 
 // ConfigureProvider accepts host configuration.
-func (*Plugin) ConfigureProvider(_ context.Context, providerName string, _ sdkplugin.ProviderConfig) error {
+func (p *Plugin) ConfigureProvider(_ context.Context, providerName string, cfg sdkplugin.ProviderConfig) error {
 	if providerName != ProviderName {
 		return fmt.Errorf("unknown provider: %s", providerName)
 	}
+
+	// Reset to defaults so that a reconfiguration call (or one that omits the
+	// httpClient block) always produces a consistent result rather than
+	// inheriting state from a prior call.
+	p.provider.allowPrivateIPs = false
+	// Invalidate any cached HTTP client so the next getClient call picks up
+	// the newly applied configuration.
+	p.provider.client = nil
+
+	// Read httpClient settings from host.
+	if raw, ok := cfg.Settings["httpClient"]; ok {
+		var httpCfg struct {
+			AllowPrivateIPs bool `json:"allowPrivateIPs"`
+		}
+		if err := json.Unmarshal(raw, &httpCfg); err != nil {
+			return fmt.Errorf("configuring provider %s: unmarshal httpClient settings: %w", providerName, err)
+		}
+		p.provider.allowPrivateIPs = httpCfg.AllowPrivateIPs
+	}
+
 	return nil
 }
 
@@ -341,6 +364,7 @@ func (p *Provider) getClient(ctx context.Context) *httpc.Client {
 	}
 	cfg := httpc.DefaultConfig()
 	cfg.EnableCache = false
+	cfg.AllowPrivateIPs = p.allowPrivateIPs
 	cfg.OnUnauthorized = func(innerCtx context.Context) (string, error) {
 		hostClient := sdkplugin.HostClientFromContext(innerCtx)
 		if hostClient == nil {
@@ -368,7 +392,8 @@ func (p *Provider) getClient(ctx context.Context) *httpc.Client {
 		req.Header.Set("Authorization", "Bearer "+resp.AccessToken)
 		return nil
 	})
-	return httpc.NewClient(cfg)
+	p.client = httpc.NewClient(cfg)
+	return p.client
 }
 
 // execute runs the requested GitHub API operation.
