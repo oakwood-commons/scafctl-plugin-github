@@ -583,7 +583,7 @@ func TestProvider_WaitForWriteAccess_ImmediateAdmin(t *testing.T) {
 		json.NewEncoder(w).Encode(viewerPermissionResponse()) //nolint:errcheck,gosec
 	})
 
-	client := p.getClient(context.Background())
+	client := p.getClient()
 	err := p.waitForWriteAccess(context.Background(), client, baseURL, "test-org", "test-repo")
 	require.NoError(t, err)
 	assert.Equal(t, int32(1), callCount.Load())
@@ -613,7 +613,7 @@ func TestProvider_WaitForWriteAccess_EventualWrite(t *testing.T) {
 		})
 	})
 
-	client := p.getClient(context.Background())
+	client := p.getClient()
 	err := p.waitForWriteAccess(context.Background(), client, baseURL, "test-org", "test-repo")
 	require.NoError(t, err)
 	assert.Equal(t, int32(3), callCount.Load())
@@ -634,7 +634,7 @@ func TestProvider_WaitForWriteAccess_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	client := p.getClient(ctx)
+	client := p.getClient()
 	err := p.waitForWriteAccess(ctx, client, baseURL, "test-org", "test-repo")
 	require.Error(t, err)
 }
@@ -1063,7 +1063,7 @@ func TestProvider_InitRepoWithReadme_Success(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"content": map[string]any{"name": "README.md"}}) //nolint:errcheck,gosec
 	})
 
-	client := p.getClient(context.Background())
+	client := p.getClient()
 	err := p.initRepoWithReadme(context.Background(), client, baseURL, "my-org/my-repo")
 	require.NoError(t, err)
 }
@@ -1084,7 +1084,7 @@ func TestProvider_InitRepoWithReadme_RetryOn404(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"content": map[string]any{"name": "README.md"}}) //nolint:errcheck,gosec
 	})
 
-	client := p.getClient(context.Background())
+	client := p.getClient()
 	err := p.initRepoWithReadme(context.Background(), client, baseURL, "my-org/my-repo")
 	require.NoError(t, err)
 	assert.Equal(t, int32(3), callCount.Load())
@@ -1102,7 +1102,7 @@ func TestProvider_InitRepoWithReadme_ContextCancelled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // Cancel immediately
 
-	client := p.getClient(ctx)
+	client := p.getClient()
 	err := p.initRepoWithReadme(ctx, client, baseURL, "my-org/my-repo")
 	require.Error(t, err)
 }
@@ -1118,7 +1118,7 @@ func TestProvider_InitRepoWithReadme_NonRetryableError(t *testing.T) {
 		json.NewEncoder(w).Encode(map[string]any{"message": "Forbidden"}) //nolint:errcheck,gosec
 	})
 
-	client := p.getClient(context.Background())
+	client := p.getClient()
 	err := p.initRepoWithReadme(context.Background(), client, baseURL, "my-org/my-repo")
 	require.Error(t, err)
 	assert.Equal(t, int32(1), callCount.Load(), "should not retry on non-404 errors")
