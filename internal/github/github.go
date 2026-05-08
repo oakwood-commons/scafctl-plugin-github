@@ -358,7 +358,9 @@ func (*Plugin) StopProvider(_ context.Context, _ string) error {
 
 // getClient returns the provider's httpc client, creating a default one if needed.
 // In plugin mode, auth is injected via HostService RPC (GetAuthToken for "github" handler).
-func (p *Provider) getClient(ctx context.Context) *httpc.Client {
+// Auth tokens are obtained per-request via req.Context() which carries the fresh
+// HostClient injected by the SDK on each ExecuteProvider RPC.
+func (p *Provider) getClient() *httpc.Client {
 	if p.client != nil {
 		return p.client
 	}
@@ -377,15 +379,16 @@ func (p *Provider) getClient(ctx context.Context) *httpc.Client {
 		return "Bearer " + resp.AccessToken, nil
 	}
 	cfg.RequestHooks = append(cfg.RequestHooks, func(req *http.Request) error {
-		hostClient := sdkplugin.HostClientFromContext(ctx)
+		reqCtx := req.Context()
+		hostClient := sdkplugin.HostClientFromContext(reqCtx)
 		if hostClient == nil {
-			lgr := logr.FromContextOrDiscard(ctx)
+			lgr := logr.FromContextOrDiscard(reqCtx)
 			lgr.V(1).Info("host service client not available, making unauthenticated request")
 			return nil
 		}
-		resp, err := hostClient.GetAuthToken(ctx, "github", "", 0, false)
+		resp, err := hostClient.GetAuthToken(reqCtx, "github", "", 0, false)
 		if err != nil {
-			lgr := logr.FromContextOrDiscard(ctx)
+			lgr := logr.FromContextOrDiscard(reqCtx)
 			lgr.V(1).Info("GitHub auth token unavailable, making unauthenticated request", "error", err)
 			return nil
 		}
@@ -426,7 +429,7 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 		return nil, fmt.Errorf("%s: 'owner' and 'repo' are required for %s operation", ProviderName, operation)
 	}
 
-	client := p.getClient(ctx)
+	client := p.getClient()
 
 	var result *sdkprovider.Output
 	var err error
