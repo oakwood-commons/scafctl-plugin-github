@@ -7,7 +7,7 @@ require (
 	github.com/go-logr/logr v1.4.3
 	github.com/google/jsonschema-go v0.4.3
 	github.com/oakwood-commons/httpc v0.1.0
-	github.com/oakwood-commons/scafctl-plugin-sdk v0.5.1
+	github.com/oakwood-commons/scafctl-plugin-sdk v0.7.0
 	github.com/stretchr/testify v1.11.1
 )
 
