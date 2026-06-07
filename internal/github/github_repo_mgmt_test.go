@@ -105,15 +105,15 @@ func TestProvider_Execute_CreateRepo_DefaultVisibility(t *testing.T) {
 	p, baseURL := testProvider(t, graphqlHandler(t,
 		func(_ string, vars map[string]any) {
 			input := vars["input"].(map[string]any)
-			assert.Equal(t, "PUBLIC", input["visibility"])
+			assert.Equal(t, "PRIVATE", input["visibility"])
 		},
 		map[string]any{
 			"data": map[string]any{
 				"createRepository": map[string]any{
 					"repository": map[string]any{
 						"id":            "R_456",
-						"name":          "public-repo",
-						"nameWithOwner": "testuser/public-repo",
+						"name":          "default-repo",
+						"nameWithOwner": "testuser/default-repo",
 					},
 				},
 			},
@@ -122,8 +122,41 @@ func TestProvider_Execute_CreateRepo_DefaultVisibility(t *testing.T) {
 
 	output, err := p.execute(context.Background(), map[string]any{
 		"operation": "create_repo",
-		"repo":      "public-repo",
+		"repo":      "default-repo",
 		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+}
+
+func TestProvider_Execute_CreateRepo_InternalVisibility(t *testing.T) {
+	t.Parallel()
+
+	p, baseURL := testProvider(t, graphqlHandler(t,
+		func(_ string, vars map[string]any) {
+			input := vars["input"].(map[string]any)
+			assert.Equal(t, "INTERNAL", input["visibility"])
+		},
+		map[string]any{
+			"data": map[string]any{
+				"createRepository": map[string]any{
+					"repository": map[string]any{
+						"id":            "R_789",
+						"name":          "internal-repo",
+						"nameWithOwner": "test-org/internal-repo",
+					},
+				},
+			},
+		},
+	))
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation":  "create_repo",
+		"repo":       "internal-repo",
+		"visibility": "internal",
+		"api_base":   baseURL,
 	})
 
 	require.NoError(t, err)
