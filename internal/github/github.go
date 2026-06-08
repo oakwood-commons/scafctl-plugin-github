@@ -39,6 +39,17 @@ import (
 // ProviderName is the registered name for this provider.
 const ProviderName = "github"
 
+// version is set at build time via -ldflags.
+var version string
+
+// Version returns the build-time version string, or "dev" if unset.
+func Version() string {
+	if version != "" {
+		return version
+	}
+	return "dev"
+}
+
 // defaultAPIBase is the default GitHub API base URL.
 const defaultAPIBase = "https://api.github.com"
 
@@ -1013,8 +1024,8 @@ func buildInputSchema() *jsonschema.Schema {
 				sdkhelper.WithMaxLength(1000),
 			),
 			"visibility": sdkhelper.StringProp("Repository visibility for create_repo",
-				sdkhelper.WithEnum("public", "private"),
-				sdkhelper.WithDefault("public"),
+				sdkhelper.WithEnum("public", "private", "internal"),
+				sdkhelper.WithDefault("private"),
 			),
 			"auto_init":    sdkhelper.BoolProp("Initialize repo with a README (uses REST API; GraphQL lacks auto_init support)"),
 			"ruleset_name": sdkhelper.StringProp("Name for the repository ruleset", sdkhelper.WithMaxLength(200)),

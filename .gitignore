@@ -8,6 +8,7 @@
 *.out
 
 # Coverage
+/cover/
 coverage.*
 *.coverprofile
 

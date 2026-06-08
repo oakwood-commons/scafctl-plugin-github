@@ -181,15 +181,18 @@ func (p *Provider) waitForWriteAccess(ctx context.Context, client *httpc.Client,
 func (p *Provider) executeCreateRepoGraphQL(ctx context.Context, client *httpc.Client, apiBase string, inputs map[string]any, name string) (*sdkprovider.Output, error) {
 	mutInput := map[string]any{
 		"name":       name,
-		"visibility": "PUBLIC",
+		"visibility": "PRIVATE",
 	}
 
 	if desc := getStringInput(inputs, "description"); desc != "" {
 		mutInput["description"] = desc
 	}
 
-	if strings.EqualFold(getStringInput(inputs, "visibility"), "private") {
-		mutInput["visibility"] = "PRIVATE"
+	switch strings.ToLower(getStringInput(inputs, "visibility")) {
+	case "public":
+		mutInput["visibility"] = "PUBLIC"
+	case "internal":
+		mutInput["visibility"] = "INTERNAL"
 	}
 
 	// If owner is specified, resolve its node ID and set ownerId on the mutation input.
@@ -292,7 +295,11 @@ func (p *Provider) executeCreateRepoREST(ctx context.Context, client *httpc.Clie
 		reqBody["description"] = desc
 	}
 
-	reqBody["private"] = strings.EqualFold(getStringInput(inputs, "visibility"), "private")
+	visibility := strings.ToLower(getStringInput(inputs, "visibility"))
+	if visibility == "" {
+		visibility = "private"
+	}
+	reqBody["visibility"] = visibility
 
 	// Try org endpoint first.
 	orgURL := fmt.Sprintf("%s/orgs/%s/repos", apiBase, owner)
@@ -617,7 +624,7 @@ func (p *Provider) executeCreateFromTemplate(ctx context.Context, client *httpc.
 		reqBody["include_all_branches"] = v
 	}
 	if visibility := getStringInput(inputs, "visibility"); visibility != "" {
-		reqBody["private"] = visibility == "private"
+		reqBody["visibility"] = strings.ToLower(visibility)
 	}
 
 	restURL := fmt.Sprintf("%s/repos/%s/%s/generate", apiBase, owner, repo)
