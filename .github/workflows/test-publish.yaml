@@ -14,6 +14,7 @@ on:
           - index-only
           - push-and-index
           - debug-auth
+          - check-token
 
 permissions:
   contents: read
@@ -38,6 +39,47 @@ jobs:
 
       - name: Install crane
         uses: imjasonh/setup-crane@6da1ae018866400525525ce74ff892880c099987 # v0.5
+
+      - name: Check CATALOG_PUSH_TOKEN validity
+        if: inputs.step == 'check-token'
+        env:
+          TOKEN: ${{ secrets.CATALOG_PUSH_TOKEN }}
+        run: |
+          echo "=== Token introspection via GitHub API ==="
+          RESPONSE=$(curl -s -w "\n%{http_code}" -H "Authorization: token ${TOKEN}" https://api.github.com/user)
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "HTTP status: ${HTTP_CODE}"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Token owner: $(echo "$BODY" | jq -r '.login')"
+            echo "Token type: valid PAT"
+          elif [ "$HTTP_CODE" = "401" ]; then
+            echo "TOKEN IS INVALID OR EXPIRED"
+            echo "$BODY" | jq -r '.message' 2>/dev/null || echo "$BODY"
+          else
+            echo "Unexpected status"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+          fi
+
+          echo ""
+          echo "=== Token scopes ==="
+          curl -s -I -H "Authorization: token ${TOKEN}" https://api.github.com/user 2>/dev/null | grep -i 'x-oauth-scopes'
+
+          echo ""
+          echo "=== Token expiry check ==="
+          curl -s -I -H "Authorization: token ${TOKEN}" https://api.github.com/user 2>/dev/null | grep -i 'github-authentication-token-expiration'
+
+          echo ""
+          echo "=== GHCR token exchange test ==="
+          GHCR_RESPONSE=$(curl -s -w "\n%{http_code}" -u "USERNAME:${TOKEN}" "https://ghcr.io/token?scope=repository:oakwood-commons/catalog-index:pull,push&service=ghcr.io")
+          GHCR_CODE=$(echo "$GHCR_RESPONSE" | tail -1)
+          echo "GHCR token exchange HTTP status: ${GHCR_CODE}"
+          if [ "$GHCR_CODE" != "200" ]; then
+            echo "GHCR exchange body:"
+            echo "$GHCR_RESPONSE" | head -n -1 | jq . 2>/dev/null || echo "$GHCR_RESPONSE" | head -n -1
+          else
+            echo "GHCR token exchange: OK"
+          fi
 
       - name: Debug auth
         if: inputs.step == 'debug-auth'
