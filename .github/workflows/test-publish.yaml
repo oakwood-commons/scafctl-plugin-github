@@ -1,0 +1,79 @@
+name: Test Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to test (e.g. 0.4.5)'
+        required: true
+      step:
+        description: 'Which step to test'
+        required: true
+        type: choice
+        options:
+          - index-only
+          - push-and-index
+          - debug-auth
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test-publish:
+    name: Test Publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install scafctl
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TMP_DIR="$(mktemp -d)"
+          gh release download --repo oakwood-commons/scafctl \
+            --pattern 'scafctl_*_Linux_x86_64.tar.gz' \
+            --dir "${TMP_DIR}"
+          tar xzf "${TMP_DIR}"/scafctl_*_Linux_x86_64.tar.gz -C "${TMP_DIR}"
+          sudo mv "${TMP_DIR}/scafctl" /usr/local/bin/scafctl
+          rm -rf "${TMP_DIR}"
+
+      - name: Install crane
+        uses: imjasonh/setup-crane@6da1ae018866400525525ce74ff892880c099987 # v0.5
+
+      - name: Debug auth
+        if: inputs.step == 'debug-auth'
+        run: |
+          echo "=== GITHUB_TOKEN auth ==="
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+          echo "Testing GITHUB_TOKEN against providers/github..."
+          crane manifest ghcr.io/oakwood-commons/providers/github:${{ inputs.version }} > /dev/null 2>&1 && echo "  READ: OK" || echo "  READ: FAIL"
+          echo "Testing GITHUB_TOKEN push (dry-run tag)..."
+          crane tag ghcr.io/oakwood-commons/providers/github:${{ inputs.version }} test-push-check 2>&1 && echo "  WRITE: OK" || echo "  WRITE: FAIL"
+          crane delete ghcr.io/oakwood-commons/providers/github:test-push-check 2>/dev/null || true
+
+          echo ""
+          echo "=== CATALOG_PUSH_TOKEN auth ==="
+          AUTH2=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH2}" > ~/.docker/config.json
+          echo "Testing CATALOG_PUSH_TOKEN against catalog-index..."
+          crane manifest ghcr.io/oakwood-commons/catalog-index:latest > /dev/null 2>&1 && echo "  READ: OK" || echo "  READ: FAIL"
+          echo "Testing CATALOG_PUSH_TOKEN against providers/github..."
+          crane manifest ghcr.io/oakwood-commons/providers/github:${{ inputs.version }} > /dev/null 2>&1 && echo "  READ: OK" || echo "  READ: FAIL"
+
+      - name: Login with GITHUB_TOKEN
+        if: inputs.step == 'push-and-index'
+        run: |
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+
+      - name: Refresh catalog index (CATALOG_PUSH_TOKEN)
+        if: inputs.step == 'index-only' || inputs.step == 'push-and-index'
+        run: |
+          mkdir -p ~/.docker
+          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
+          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+          scafctl catalog index push \
+            --catalog "oci://ghcr.io/${{ github.repository_owner }}" \
+            --debug
