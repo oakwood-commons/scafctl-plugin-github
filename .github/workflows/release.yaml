@@ -68,10 +68,10 @@ jobs:
         uses: imjasonh/setup-crane@6da1ae018866400525525ce74ff892880c099987 # v0.5
 
       - name: Login to GitHub Container Registry
+        env:
+          GITHUB_TOKEN: ${{ secrets.CATALOG_PUSH_TOKEN }}
         run: |
-          mkdir -p ~/.docker
-          AUTH=$(printf '%s' "${{ github.actor }}:${{ secrets.CATALOG_PUSH_TOKEN }}" | base64 -w 0)
-          printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "${AUTH}" > ~/.docker/config.json
+          scafctl auth login github --flow pat --write-registry-auth
 
       - name: Download release archives
         env:
