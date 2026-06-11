@@ -26,3 +26,26 @@ func BenchmarkProvider_Execute_DryRun(b *testing.B) {
 		_, _ = p.execute(ctx, inputs)
 	}
 }
+
+func BenchmarkProvider_Execute_CreateForkPR_DryRun(b *testing.B) {
+	p := newProvider()
+
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+	inputs := map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "example-org",
+		"repo":      "example-repo",
+		"fork_org":  "my-fork-org",
+		"branch":    "feature-branch",
+		"message":   "feat: add scaffolded files",
+		"additions": []any{
+			map[string]any{"path": "src/main.go", "content": "package main"},
+		},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = p.execute(ctx, inputs)
+	}
+}

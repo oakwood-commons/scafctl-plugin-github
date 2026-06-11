@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
 	"github.com/stretchr/testify/assert"
@@ -1238,4 +1239,686 @@ func BenchmarkProvider_Execute_CreateRuleset_DryRun(b *testing.B) {
 	for b.Loop() {
 		_, _ = p.execute(ctx, inputs)
 	}
+}
+
+// ─── Create Fork PR Tests ───────────────────────────────────────────────────
+
+func TestProvider_Execute_CreateForkPR_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int32
+	var mu sync.Mutex
+	var requests []string
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		// REST requests
+		if r.URL.Path != "/graphql" {
+			n := callCount.Add(1)
+			mu.Lock()
+			requests = append(requests, r.Method+" "+r.URL.Path)
+			mu.Unlock()
+
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/forks"):
+				// Step 2: Fork repo
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"full_name":      "fork-org/my-repo",
+					"html_url":       "https://github.com/fork-org/my-repo",
+					"default_branch": "main",
+					"node_id":        "R_fork123",
+				})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/merge-upstream"):
+				// Step 4: Sync fork
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"message":    "Successfully fetched and fast-forwarded from upstream main.",
+					"merge_type": "fast-forward",
+				})
+			default:
+				t.Errorf("unexpected REST call #%d: %s %s", n, r.Method, r.URL.Path)
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+
+		// GraphQL requests
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+
+		mu.Lock()
+		requests = append(requests, "GRAPHQL:"+extractGQLOperation(req.Query))
+		mu.Unlock()
+
+		switch {
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			// Step 1: Get upstream repo info
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"id":               "R_upstream123",
+						"defaultBranchRef": map[string]any{"name": "main"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// Steps 3/5: Get head OID
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createRef"):
+			// Step 5: Create branch
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createRef": map[string]any{
+						"ref": map[string]any{
+							"name":   "refs/heads/feature-branch",
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "repository") && strings.Contains(req.Query, "{ id }") && !strings.Contains(req.Query, "defaultBranchRef"):
+			// resolveRepoID for createRef
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{"id": "R_fork123"},
+				},
+			})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			// Step 6: Commit
+			input := req.Variables["input"].(map[string]any)
+			branchInput := input["branch"].(map[string]any)
+			assert.Equal(t, "fork-org/my-repo", branchInput["repositoryNameWithOwner"])
+			assert.Equal(t, "feature-branch", branchInput["branchName"])
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{
+							"oid":           "newcommit123456789012345678901234567890",
+							"url":           "https://github.com/fork-org/my-repo/commit/newcommit",
+							"committedDate": "2026-06-10T12:00:00Z",
+							"message":       "feat: add files",
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createPullRequest"):
+			// Step 7: Create PR
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, "R_upstream123", input["repositoryId"])
+			assert.Equal(t, "R_fork123", input["headRepositoryId"])
+			assert.Equal(t, "feature-branch", input["headRefName"])
+			assert.Equal(t, "main", input["baseRefName"])
+			assert.Equal(t, "feat: add files", input["title"])
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createPullRequest": map[string]any{
+						"pullRequest": map[string]any{
+							"id":          "PR_123",
+							"number":      1,
+							"title":       "feat: add files",
+							"url":         "https://github.com/test-org/my-repo/pull/1",
+							"state":       "OPEN",
+							"headRefName": "feature-branch",
+							"baseRefName": "main",
+							"isDraft":     false,
+						},
+					},
+				},
+			})
+		default:
+			t.Errorf("unexpected GraphQL query: %s", req.Query[:min(100, len(req.Query))])
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	})
+
+	p.forkReadyMaxAttempts = 2
+	p.forkReadyBackoff = time.Millisecond
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "test-org",
+		"repo":      "my-repo",
+		"fork_org":  "fork-org",
+		"branch":    "feature-branch",
+		"message":   "feat: add files",
+		"additions": []any{
+			map[string]any{"path": "hello.txt", "content": "hello world"},
+		},
+		"api_base": baseURL,
+	})
+
+	require.NoError(t, err)
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+	assert.Equal(t, "create_fork_pr", data["operation"])
+
+	result := data["result"].(map[string]any)
+	fork := result["fork"].(map[string]any)
+	assert.Equal(t, "fork-org/my-repo", fork["full_name"])
+
+	commit := result["commit"].(map[string]any)
+	assert.Equal(t, "newcommit123456789012345678901234567890", commit["oid"])
+
+	pr := result["pull_request"].(map[string]any)
+	assert.Equal(t, float64(1), pr["number"])
+	assert.Equal(t, "https://github.com/test-org/my-repo/pull/1", pr["url"])
+}
+
+func TestProvider_Execute_CreateForkPR_ForkAlreadyExists(t *testing.T) {
+	t.Parallel()
+
+	var forkCallCount atomic.Int32
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path != "/graphql" {
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/forks"):
+				n := forkCallCount.Add(1)
+				if n == 1 {
+					// Fork already exists: 422
+					w.WriteHeader(http.StatusUnprocessableEntity)
+					json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+						"message": "Repository already exists",
+					})
+					return
+				}
+			case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/repos/fork-org/my-repo"):
+				// GET existing fork details
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"full_name":      "fork-org/my-repo",
+					"html_url":       "https://github.com/fork-org/my-repo",
+					"default_branch": "main",
+					"node_id":        "R_existing_fork",
+					"fork":           true,
+					"parent":         map[string]any{"full_name": "test-org/my-repo"},
+				})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/merge-upstream"):
+				json.NewEncoder(w).Encode(map[string]any{"message": "ok"}) //nolint:errcheck,gosec
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+
+		switch {
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"id":               "R_upstream",
+						"defaultBranchRef": map[string]any{"name": "main"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "repository") && strings.Contains(req.Query, "{ id }"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{"id": "R_existing_fork"},
+				},
+			})
+		case strings.Contains(req.Query, "createRef"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createRef": map[string]any{
+						"ref": map[string]any{
+							"name":   "refs/heads/my-branch",
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{
+							"oid":     "newcommit123456789012345678901234567890",
+							"url":     "https://github.com/fork-org/my-repo/commit/x",
+							"message": "test commit",
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createPullRequest"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, "R_existing_fork", input["headRepositoryId"])
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createPullRequest": map[string]any{
+						"pullRequest": map[string]any{
+							"id":     "PR_2",
+							"number": 2,
+							"url":    "https://github.com/test-org/my-repo/pull/2",
+						},
+					},
+				},
+			})
+		}
+	})
+
+	p.forkReadyMaxAttempts = 1
+	p.forkReadyBackoff = time.Millisecond
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "test-org",
+		"repo":      "my-repo",
+		"fork_org":  "fork-org",
+		"branch":    "my-branch",
+		"message":   "test commit",
+		"additions": []any{
+			map[string]any{"path": "file.txt", "content": "data"},
+		},
+		"api_base": baseURL,
+	})
+
+	require.NoError(t, err)
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+	result := data["result"].(map[string]any)
+	fork := result["fork"].(map[string]any)
+	assert.Equal(t, "fork-org/my-repo", fork["full_name"])
+}
+
+func TestProvider_Execute_CreateForkPR_ForkReadinessRetry(t *testing.T) {
+	t.Parallel()
+
+	var headOIDCalls atomic.Int32
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path != "/graphql" {
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/forks"):
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"full_name":      "fork-org/my-repo",
+					"default_branch": "main",
+					"node_id":        "R_fork",
+				})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/merge-upstream"):
+				json.NewEncoder(w).Encode(map[string]any{"message": "ok"}) //nolint:errcheck,gosec
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+
+		switch {
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"id":               "R_upstream",
+						"defaultBranchRef": map[string]any{"name": "main"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			n := headOIDCalls.Add(1)
+			if n == 1 {
+				// First call: fork not ready yet
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"data": map[string]any{
+						"repository": map[string]any{
+							"ref": nil,
+						},
+					},
+				})
+				return
+			}
+			// Subsequent calls: fork is ready
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "repository") && strings.Contains(req.Query, "{ id }"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{"id": "R_fork"},
+				},
+			})
+		case strings.Contains(req.Query, "createRef"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createRef": map[string]any{
+						"ref": map[string]any{
+							"name":   "refs/heads/branch",
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{"oid": "commit123456789012345678901234567890123"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createPullRequest"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createPullRequest": map[string]any{
+						"pullRequest": map[string]any{"number": 1, "url": "https://github.com/test-org/my-repo/pull/1"},
+					},
+				},
+			})
+		}
+	})
+
+	p.forkReadyMaxAttempts = 3
+	p.forkReadyBackoff = time.Millisecond
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "test-org",
+		"repo":      "my-repo",
+		"fork_org":  "fork-org",
+		"branch":    "branch",
+		"message":   "test",
+		"additions": []any{
+			map[string]any{"path": "f.txt", "content": "c"},
+		},
+		"api_base": baseURL,
+	})
+
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, int(headOIDCalls.Load()), 2, "should have retried get_head_oid")
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+}
+
+func TestProvider_Execute_CreateForkPR_ValidationErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		inputs map[string]any
+		errMsg string
+	}{
+		{
+			name: "missing fork_org",
+			inputs: map[string]any{
+				"operation": "create_fork_pr",
+				"owner":     "org",
+				"repo":      "repo",
+				"branch":    "b",
+				"message":   "m",
+				"additions": []any{map[string]any{"path": "f", "content": "c"}},
+			},
+			errMsg: "fork_org",
+		},
+		{
+			name: "missing branch",
+			inputs: map[string]any{
+				"operation": "create_fork_pr",
+				"owner":     "org",
+				"repo":      "repo",
+				"fork_org":  "fork",
+				"message":   "m",
+				"additions": []any{map[string]any{"path": "f", "content": "c"}},
+			},
+			errMsg: "branch",
+		},
+		{
+			name: "missing message",
+			inputs: map[string]any{
+				"operation": "create_fork_pr",
+				"owner":     "org",
+				"repo":      "repo",
+				"fork_org":  "fork",
+				"branch":    "b",
+				"additions": []any{map[string]any{"path": "f", "content": "c"}},
+			},
+			errMsg: "message",
+		},
+		{
+			name: "missing additions and deletions",
+			inputs: map[string]any{
+				"operation": "create_fork_pr",
+				"owner":     "org",
+				"repo":      "repo",
+				"fork_org":  "fork",
+				"branch":    "b",
+				"message":   "m",
+			},
+			errMsg: "additions",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p, baseURL := testProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusOK)
+			})
+			tc.inputs["api_base"] = baseURL
+
+			_, err := p.execute(context.Background(), tc.inputs)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.errMsg)
+		})
+	}
+}
+
+func TestProvider_Execute_CreateForkPR_DryRun(t *testing.T) {
+	t.Parallel()
+
+	p := newProvider()
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+
+	output, err := p.execute(ctx, map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "org",
+		"repo":      "repo",
+		"fork_org":  "fork",
+		"branch":    "b",
+		"message":   "m",
+		"additions": []any{map[string]any{"path": "f", "content": "c"}},
+	})
+
+	require.NoError(t, err)
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+	assert.Equal(t, "create_fork_pr", data["operation"])
+	result := data["result"].(map[string]any)
+	assert.Equal(t, true, result["dry_run"])
+}
+
+func TestProvider_Execute_CreateForkPR_Force(t *testing.T) {
+	t.Parallel()
+
+	var branchDeleted atomic.Bool
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.URL.Path != "/graphql" {
+			switch {
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/forks"):
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"full_name":      "fork-org/my-repo",
+					"default_branch": "main",
+					"node_id":        "R_fork",
+				})
+			case r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/merge-upstream"):
+				json.NewEncoder(w).Encode(map[string]any{"message": "ok"}) //nolint:errcheck,gosec
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+
+		switch {
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"id":               "R_upstream",
+						"defaultBranchRef": map[string]any{"name": "main"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "ref(qualifiedName") && strings.Contains(req.Query, "target { oid }"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "ref(qualifiedName") && strings.Contains(req.Query, "{ id }"):
+			// resolveRefID for deletion
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{"id": "REF_id_to_delete"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "repository") && strings.Contains(req.Query, "{ id }") && !strings.Contains(req.Query, "ref"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{"id": "R_fork"},
+				},
+			})
+		case strings.Contains(req.Query, "deleteRef"):
+			branchDeleted.Store(true)
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"deleteRef": map[string]any{"clientMutationId": "x"},
+				},
+			})
+		case strings.Contains(req.Query, "createRef"):
+			input := req.Variables["input"].(map[string]any)
+			// After first createRef fails (already exists), force causes delete + recreate
+			if branchDeleted.Load() {
+				assert.Equal(t, "refs/heads/feature", input["name"])
+			} else {
+				// First createRef attempt: simulate "already exists"
+				json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+					"errors": []map[string]any{
+						{"message": "A ref named refs/heads/feature already exists", "type": "UNPROCESSABLE"},
+					},
+				})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createRef": map[string]any{
+						"ref": map[string]any{
+							"name":   "refs/heads/feature",
+							"target": map[string]any{"oid": "abc123def456abc123def456abc123def456abc1"},
+						},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{"oid": "newoid12345678901234567890123456789012"},
+					},
+				},
+			})
+		case strings.Contains(req.Query, "createPullRequest"):
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createPullRequest": map[string]any{
+						"pullRequest": map[string]any{"number": 3, "url": "https://github.com/org/repo/pull/3"},
+					},
+				},
+			})
+		}
+	})
+
+	p.forkReadyMaxAttempts = 1
+	p.forkReadyBackoff = time.Millisecond
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "create_fork_pr",
+		"owner":     "test-org",
+		"repo":      "my-repo",
+		"fork_org":  "fork-org",
+		"branch":    "feature",
+		"message":   "update",
+		"force":     true,
+		"additions": []any{
+			map[string]any{"path": "file.go", "content": "package main"},
+		},
+		"api_base": baseURL,
+	})
+
+	require.NoError(t, err)
+	assert.True(t, branchDeleted.Load(), "branch should have been deleted for force-reset")
+	data := output.Data.(map[string]any)
+	assert.Equal(t, true, data["success"])
+}
+
+// extractGQLOperation returns a short label for the GraphQL query for logging.
+func extractGQLOperation(query string) string {
+	if strings.Contains(query, "createPullRequest") {
+		return "createPullRequest"
+	}
+	if strings.Contains(query, "createCommitOnBranch") {
+		return "createCommitOnBranch"
+	}
+	if strings.Contains(query, "createRef") {
+		return "createRef"
+	}
+	if strings.Contains(query, "deleteRef") {
+		return "deleteRef"
+	}
+	if strings.Contains(query, "defaultBranchRef") {
+		return "getRepoInfo"
+	}
+	if strings.Contains(query, "ref(qualifiedName") {
+		return "getHeadOID"
+	}
+	if strings.Contains(query, "{ id }") {
+		return "resolveRepoID"
+	}
+	return "unknown"
 }

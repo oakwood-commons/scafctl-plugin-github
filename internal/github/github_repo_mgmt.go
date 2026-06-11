@@ -671,3 +671,417 @@ func (p *Provider) executeSetCustomProperties(ctx context.Context, client *httpc
 	}
 	return actionOutput("set_custom_properties", result), nil
 }
+
+// ─── Create Fork PR (compound) ──────────────────────────────────────────────
+
+// executeCreateForkPR performs a compound fork → sync → branch → commit → PR workflow.
+// This replaces the error-prone 4-action chain previously required in solutions.
+func (p *Provider) executeCreateForkPR(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
+
+	// --- Validate required inputs ---
+	forkOrg := getStringInput(inputs, "fork_org")
+	if forkOrg == "" {
+		return nil, requiredInputError("create_fork_pr", "fork_org", inputs, "organization to fork into")
+	}
+	branch := getStringInput(inputs, "branch")
+	if branch == "" {
+		return nil, requiredInputError("create_fork_pr", "branch", inputs, "branch name for the PR")
+	}
+	message := getStringInput(inputs, "message")
+	if message == "" {
+		return nil, requiredInputError("create_fork_pr", "message", inputs, "commit message headline")
+	}
+
+	additions, deletions, err := parseFileChanges(inputs)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: %w", err)
+	}
+	if len(additions) == 0 && len(deletions) == 0 {
+		return nil, fmt.Errorf("create_fork_pr requires at least one 'additions' or 'deletions' entry")
+	}
+
+	// Optional inputs with defaults.
+	title := getStringInput(inputs, "title")
+	if title == "" {
+		title = message
+	}
+	body := getStringInput(inputs, "body")
+	base := getStringInput(inputs, "base")
+	draft, _ := getBoolInput(inputs, "draft")
+	syncFork := true
+	if v, ok := getBoolInput(inputs, "sync_fork"); ok {
+		syncFork = v
+	}
+	force, _ := getBoolInput(inputs, "force")
+
+	// --- Step 1: Fetch upstream default branch (for PR base) ---
+	lgr.V(1).Info("create_fork_pr: fetching upstream repo info", "owner", owner, "repo", repo)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	upstreamDefaultBranch, upstreamRepoID, err := p.getRepoInfo(ctx, client, apiBase, owner, repo)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: fetching upstream repo: %w", err)
+	}
+	if base == "" {
+		base = upstreamDefaultBranch
+	}
+
+	// --- Step 2: Fork the repository ---
+	lgr.V(1).Info("create_fork_pr: forking repository", "owner", owner, "repo", repo, "fork_org", forkOrg)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	forkResult, err := p.forkOrGetExisting(ctx, client, apiBase, owner, repo, forkOrg, base == upstreamDefaultBranch)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: fork failed: %w", err)
+	}
+	forkNodeID, _ := forkResult["node_id"].(string)
+	if forkNodeID == "" {
+		return nil, fmt.Errorf("create_fork_pr: fork response missing node_id for %s/%s", forkOrg, repo)
+	}
+
+	// --- Step 3: Wait for fork readiness ---
+	lgr.V(1).Info("create_fork_pr: waiting for fork readiness", "fork_org", forkOrg, "repo", repo)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	headOID, err := p.waitForForkReady(ctx, client, apiBase, forkOrg, repo, base)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: fork not ready: %w", err)
+	}
+
+	// --- Step 4: Sync fork with upstream (if enabled) ---
+	if syncFork {
+		lgr.V(1).Info("create_fork_pr: syncing fork with upstream", "fork_org", forkOrg, "repo", repo)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		if syncErr := p.syncForkWithUpstream(ctx, client, apiBase, forkOrg, repo, base); syncErr != nil {
+			// Non-fatal: log and continue (fork may already be up to date or merge-upstream unsupported)
+			lgr.V(1).Info("create_fork_pr: sync fork warning (continuing)", "error", syncErr)
+		} else {
+			// Re-fetch HEAD OID after sync.
+			newOID, err := p.getHeadOID(ctx, client, apiBase, forkOrg, repo, base)
+			if err == nil {
+				headOID = newOID
+			}
+		}
+	}
+
+	// --- Step 5: Create or force-reset branch on fork ---
+	lgr.V(1).Info("create_fork_pr: creating branch on fork", "fork_org", forkOrg, "repo", repo, "branch", branch, "force", force)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	branchOID, err := p.createOrResetBranch(ctx, client, apiBase, forkOrg, repo, branch, headOID, force)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: branch creation failed: %w", err)
+	}
+
+	// --- Step 6: Commit files ---
+	lgr.V(1).Info("create_fork_pr: committing files", "fork_org", forkOrg, "repo", repo, "branch", branch)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	commitOutput, err := p.commitWithRetry(ctx, client, apiBase, forkOrg, repo, branch, message, branchOID, additions, deletions, inputs)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: commit failed (fork: %s/%s): %w", forkOrg, repo, err)
+	}
+	var commitResult any
+	if dataMap, ok := commitOutput.Data.(map[string]any); ok {
+		commitResult = dataMap["result"]
+	}
+
+	// --- Step 7: Create cross-repo pull request ---
+	lgr.V(1).Info("create_fork_pr: creating pull request", "head", forkOrg+":"+branch, "base", base)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	prOutput, err := p.createCrossRepoPR(ctx, client, apiBase, upstreamRepoID, forkNodeID, branch, base, title, body, draft)
+	if err != nil {
+		return nil, fmt.Errorf("create_fork_pr: pull request creation failed: %w", err)
+	}
+
+	return actionOutput("create_fork_pr", map[string]any{
+		"fork":         forkResult,
+		"commit":       commitResult,
+		"pull_request": prOutput,
+	}), nil
+}
+
+// getRepoInfo fetches the default branch and node ID for a repository.
+func (p *Provider) getRepoInfo(ctx context.Context, client *httpc.Client, apiBase, owner, repo string) (defaultBranch, nodeID string, err error) {
+	query := `query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    id
+    defaultBranchRef { name }
+  }
+}`
+	data, err := graphqlDo(ctx, client, apiBase, query, map[string]any{"owner": owner, "name": repo})
+	if err != nil {
+		return "", "", err
+	}
+	repoNode, err := extractNodeMap(data, "repository")
+	if err != nil {
+		return "", "", err
+	}
+	nodeID, _ = repoNode["id"].(string)
+	if nodeID == "" {
+		return "", "", fmt.Errorf("repository %s/%s: missing node ID in GraphQL response", owner, repo)
+	}
+	if branchRef, ok := repoNode["defaultBranchRef"].(map[string]any); ok {
+		defaultBranch, _ = branchRef["name"].(string)
+	}
+	if defaultBranch == "" {
+		return "", "", fmt.Errorf("repository %s/%s: could not determine default branch from API response", owner, repo)
+	}
+	return defaultBranch, nodeID, nil
+}
+
+// forkOrGetExisting forks a repo or returns existing fork details on 422.
+func (p *Provider) forkOrGetExisting(ctx context.Context, client *httpc.Client, apiBase, owner, repo, forkOrg string, defaultBranchOnly bool) (map[string]any, error) {
+	reqBody := map[string]any{
+		"organization":        forkOrg,
+		"default_branch_only": defaultBranchOnly,
+	}
+
+	restURL := fmt.Sprintf("%s/repos/%s/%s/forks", apiBase, owner, repo)
+	result, err := p.doRESTRequest(ctx, client, http.MethodPost, restURL, reqBody)
+	if err != nil {
+		var re *restError
+		if errors.As(err, &re) && re.StatusCode == http.StatusUnprocessableEntity {
+			// Fork already exists -- fetch it.
+			getURL := fmt.Sprintf("%s/repos/%s/%s", apiBase, forkOrg, repo)
+			existing, getErr := p.doRESTRequest(ctx, client, http.MethodGet, getURL, nil)
+			if getErr != nil {
+				return nil, fmt.Errorf("fork already exists but failed to fetch: %w", getErr)
+			}
+			m, ok := existing.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("fork already exists but response for %s/%s is not a JSON object", forkOrg, repo)
+			}
+			// Validate that the existing repo is actually a fork of the upstream.
+			if parent, hasParent := m["parent"].(map[string]any); hasParent {
+				parentFullName, _ := parent["full_name"].(string)
+				expected := owner + "/" + repo
+				if parentFullName != expected {
+					return nil, fmt.Errorf("repo %s/%s exists but is not a fork of %s (parent: %s)", forkOrg, repo, expected, parentFullName)
+				}
+			} else if isFork, _ := m["fork"].(bool); !isFork {
+				return nil, fmt.Errorf("repo %s/%s exists but is not a fork", forkOrg, repo)
+			}
+			return m, nil
+		}
+		return nil, err
+	}
+	m, ok := result.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("fork response for %s/%s is not a JSON object", owner, repo)
+	}
+	return m, nil
+}
+
+// waitForForkReady polls get_head_oid on the fork until the branch is accessible.
+func (p *Provider) waitForForkReady(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch string) (string, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
+
+	var lastErr error
+	for attempt := range p.forkReadyMaxAttempts {
+		if attempt > 0 {
+			delay := p.forkReadyBackoff
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return "", ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		oid, err := p.getHeadOID(ctx, client, apiBase, forkOrg, repo, branch)
+		if err == nil {
+			lgr.V(1).Info("fork ready", "attempt", attempt+1, "oid", oid)
+			return oid, nil
+		}
+		lastErr = err
+		lgr.V(1).Info("fork not ready yet", "attempt", attempt+1, "error", err)
+	}
+	return "", fmt.Errorf("fork not ready after %d attempts: %w", p.forkReadyMaxAttempts, lastErr)
+}
+
+// getHeadOID fetches the HEAD OID for a branch on a repository.
+func (p *Provider) getHeadOID(ctx context.Context, client *httpc.Client, apiBase, owner, repo, branch string) (string, error) {
+	query := `query($owner: String!, $name: String!, $qualifiedName: String!) {
+  repository(owner: $owner, name: $name) {
+    ref(qualifiedName: $qualifiedName) {
+      target { oid }
+    }
+  }
+}`
+	vars := map[string]any{"owner": owner, "name": repo, "qualifiedName": "refs/heads/" + branch}
+	data, err := graphqlDo(ctx, client, apiBase, query, vars)
+	if err != nil {
+		return "", err
+	}
+	ref, err := extractNode(data, "repository.ref")
+	if err != nil {
+		return "", err
+	}
+	if ref == nil {
+		return "", fmt.Errorf("branch %q not found on %s/%s", branch, owner, repo)
+	}
+	refMap, ok := ref.(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("unexpected ref format")
+	}
+	target, ok := refMap["target"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("unexpected ref target format")
+	}
+	oid, _ := target["oid"].(string)
+	if oid == "" {
+		return "", fmt.Errorf("empty OID for branch %q", branch)
+	}
+	return oid, nil
+}
+
+// syncForkWithUpstream syncs the fork's branch with the upstream using the merge-upstream API.
+func (p *Provider) syncForkWithUpstream(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch string) error {
+	restURL := fmt.Sprintf("%s/repos/%s/%s/merge-upstream", apiBase, forkOrg, repo)
+	reqBody := map[string]any{"branch": branch}
+	_, err := p.doRESTRequest(ctx, client, http.MethodPost, restURL, reqBody)
+	return err
+}
+
+// createOrResetBranch creates a branch on the fork, handling force-reset and already-exists scenarios.
+func (p *Provider) createOrResetBranch(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch, oid string, force bool) (string, error) {
+	_, err := p.executeCreateRef(ctx, client, apiBase, forkOrg, repo, "create_branch", "refs/heads/"+branch, oid)
+	if err == nil {
+		return oid, nil
+	}
+
+	// Check if branch already exists (GraphQL returns UNPROCESSABLE or error containing "already exists").
+	if !isBranchAlreadyExists(err) {
+		return "", err
+	}
+
+	if force {
+		// Delete and recreate.
+		refID, delErr := p.resolveRefID(ctx, client, apiBase, forkOrg, repo, "refs/heads/"+branch)
+		if delErr != nil {
+			return "", fmt.Errorf("resolving branch for deletion: %w", delErr)
+		}
+		delMutation := `mutation($input: DeleteRefInput!) { deleteRef(input: $input) { clientMutationId } }`
+		if _, delErr = graphqlDo(ctx, client, apiBase, delMutation, map[string]any{"input": map[string]any{"refId": refID}}); delErr != nil {
+			return "", fmt.Errorf("deleting branch for force-reset: %w", delErr)
+		}
+		// Recreate.
+		if _, err = p.executeCreateRef(ctx, client, apiBase, forkOrg, repo, "create_branch", "refs/heads/"+branch, oid); err != nil {
+			return "", fmt.Errorf("recreating branch after force-delete: %w", err)
+		}
+		return oid, nil
+	}
+
+	// Not forcing -- use existing branch HEAD OID.
+	existingOID, err := p.getHeadOID(ctx, client, apiBase, forkOrg, repo, branch)
+	if err != nil {
+		return "", fmt.Errorf("fetching existing branch OID: %w", err)
+	}
+	return existingOID, nil
+}
+
+// isBranchAlreadyExists checks if an error indicates the ref already exists.
+func isBranchAlreadyExists(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already exists") || strings.Contains(msg, "reference already exists")
+}
+
+// commitWithRetry commits to the fork with FORBIDDEN retry logic for permission propagation.
+func (p *Provider) commitWithRetry(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch, message, expectedOID string, additions []fileAddition, deletions []fileDeletion, inputs map[string]any) (*sdkprovider.Output, error) {
+	lgr := logr.FromContextOrDiscard(ctx)
+	var lastErr error
+
+	for attempt := range p.commitMaxAttempts {
+		if attempt > 0 {
+			delay := time.Duration(attempt) * p.commitRetryBackoff
+			lgr.V(1).Info("retrying commit after FORBIDDEN", "attempt", attempt+1, "delay", delay)
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+
+		output, err := p.executeCreateCommitGraphQL(ctx, client, apiBase, forkOrg, repo, branch, message, expectedOID, additions, deletions, inputs)
+		if err == nil {
+			return output, nil
+		}
+		lastErr = err
+
+		if !isGraphQLForbidden(err) {
+			return nil, err
+		}
+	}
+	return nil, lastErr
+}
+
+// createCrossRepoPR creates a pull request from a fork branch to the upstream repo.
+func (p *Provider) createCrossRepoPR(ctx context.Context, client *httpc.Client, apiBase, upstreamRepoID, forkRepoNodeID, headBranch, baseBranch, title, body string, draft bool) (map[string]any, error) {
+	mutInput := map[string]any{
+		"repositoryId": upstreamRepoID,
+		"title":        title,
+		"headRefName":  headBranch,
+		"baseRefName":  baseBranch,
+	}
+	if forkRepoNodeID != "" {
+		mutInput["headRepositoryId"] = forkRepoNodeID
+	}
+	if body != "" {
+		mutInput["body"] = body
+	}
+	if draft {
+		mutInput["draft"] = true
+	}
+
+	mutation := `mutation($input: CreatePullRequestInput!) {
+  createPullRequest(input: $input) {
+    pullRequest {
+      id
+      number
+      title
+      url
+      state
+      headRefName
+      baseRefName
+      isDraft
+      createdAt
+      author { login }
+    }
+  }
+}`
+
+	data, err := graphqlDo(ctx, client, apiBase, mutation, map[string]any{"input": mutInput})
+	if err != nil {
+		return nil, err
+	}
+
+	pr, err := extractNodeMap(data, "createPullRequest.pullRequest")
+	if err != nil {
+		return nil, err
+	}
+	return pr, nil
+}
