@@ -119,6 +119,49 @@ func TestWithRetryConfig_PositiveValuesUnchanged(t *testing.T) {
 	assert.Equal(t, 500*time.Millisecond, p.initRepoRetryBackoff)
 }
 
+func TestWithForkReadyConfig(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name            string
+		maxAttempts     int
+		backoff         time.Duration
+		wantMaxAttempts int
+		wantBackoff     time.Duration
+	}{
+		{
+			name:            "zero values are clamped",
+			maxAttempts:     0,
+			backoff:         -time.Second,
+			wantMaxAttempts: 1,
+			wantBackoff:     0,
+		},
+		{
+			name:            "negative maxAttempts clamped to 1",
+			maxAttempts:     -5,
+			backoff:         0,
+			wantMaxAttempts: 1,
+			wantBackoff:     0,
+		},
+		{
+			name:            "positive values unchanged",
+			maxAttempts:     10,
+			backoff:         3 * time.Second,
+			wantMaxAttempts: 10,
+			wantBackoff:     3 * time.Second,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			p := newProvider(WithForkReadyConfig(tc.maxAttempts, tc.backoff))
+			assert.Equal(t, tc.wantMaxAttempts, p.forkReadyMaxAttempts)
+			assert.Equal(t, tc.wantBackoff, p.forkReadyBackoff)
+		})
+	}
+}
+
 // ─── Read Operation Tests ────────────────────────────────────────────────────
 
 func TestProvider_Execute_GetRepo(t *testing.T) {

@@ -62,6 +62,8 @@ const (
 	defaultWaitPollInterval     = 2 * time.Second
 	defaultInitRepoMaxRetries   = 3
 	defaultInitRepoRetryBackoff = 1 * time.Second
+	defaultForkReadyMaxAttempts = 10
+	defaultForkReadyBackoff     = 3 * time.Second
 )
 
 // allOperations lists every supported operation name for error messages.
@@ -108,7 +110,7 @@ var allOperations = []string{
 	"list_environments", "create_or_update_environment", "delete_environment",
 	// Repository settings (REST)
 	"list_topics", "replace_topics",
-	"fork_repo", "create_from_template",
+	"fork_repo", "create_from_template", "create_fork_pr",
 	// Custom properties (REST)
 	"list_custom_properties", "set_custom_properties",
 	// Generic API call (REST)
@@ -155,6 +157,8 @@ type Provider struct {
 	waitPollInterval     time.Duration
 	initRepoMaxRetries   int
 	initRepoRetryBackoff time.Duration
+	forkReadyMaxAttempts int
+	forkReadyBackoff     time.Duration
 }
 
 // Option configures a Provider.
@@ -177,6 +181,14 @@ func WithRetryConfig(commitMaxAttempts int, commitRetryBackoff time.Duration, wa
 		p.waitPollInterval = max(0, waitPollInterval)
 		p.initRepoMaxRetries = max(1, initRepoMaxRetries)
 		p.initRepoRetryBackoff = max(0, initRepoRetryBackoff)
+	}
+}
+
+// WithForkReadyConfig overrides fork-readiness retry timing (useful for testing).
+func WithForkReadyConfig(maxAttempts int, backoff time.Duration) Option {
+	return func(p *Provider) {
+		p.forkReadyMaxAttempts = max(1, maxAttempts)
+		p.forkReadyBackoff = max(0, backoff)
 	}
 }
 
@@ -203,6 +215,8 @@ func newProvider(opts ...Option) *Provider {
 		waitPollInterval:     defaultWaitPollInterval,
 		initRepoMaxRetries:   defaultInitRepoMaxRetries,
 		initRepoRetryBackoff: defaultInitRepoRetryBackoff,
+		forkReadyMaxAttempts: defaultForkReadyMaxAttempts,
+		forkReadyBackoff:     defaultForkReadyBackoff,
 		descriptor: &sdkprovider.Descriptor{
 			Name:        ProviderName,
 			DisplayName: "GitHub API",
@@ -268,7 +282,7 @@ func newProvider(opts ...Option) *Provider {
 				"create_or_update_environment", "delete_environment",
 				// Repository settings mutations
 				"replace_topics",
-				"fork_repo", "create_from_template",
+				"fork_repo", "create_from_template", "create_fork_pr",
 				// Custom properties mutations
 				"set_custom_properties",
 			},
@@ -623,6 +637,8 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 		result, err = p.executeReplaceTopics(ctx, client, apiBase, owner, repo, inputs)
 	case "fork_repo":
 		result, err = p.executeForkRepo(ctx, client, apiBase, owner, repo, inputs)
+	case "create_fork_pr":
+		result, err = p.executeCreateForkPR(ctx, client, apiBase, owner, repo, inputs)
 	case "create_from_template":
 		result, err = p.executeCreateFromTemplate(ctx, client, apiBase, owner, repo, inputs)
 
@@ -1137,6 +1153,11 @@ func buildInputSchema() *jsonschema.Schema {
 			"new_repo_name":        sdkhelper.StringProp("Name for new repository (create_from_template)", sdkhelper.WithMaxLength(200)),
 			"new_owner":            sdkhelper.StringProp("Owner for new repository (create_from_template)", sdkhelper.WithMaxLength(200)),
 			"include_all_branches": sdkhelper.BoolProp("Include all branches when creating from template"),
+
+			// --- create_fork_pr compound operation fields ---
+			"fork_org":  sdkhelper.StringProp("Organization to fork into (for create_fork_pr)", sdkhelper.WithMaxLength(200)),
+			"force":     sdkhelper.BoolProp("Delete and recreate the branch if it already exists (create_fork_pr)"),
+			"sync_fork": sdkhelper.BoolProp("Sync the fork's base branch with upstream before branching (create_fork_pr, default true)"),
 
 			// --- Custom properties fields ---
 			"properties": sdkhelper.ObjectProp("Custom properties to set (key-value map)", nil, nil),
