@@ -115,6 +115,8 @@ var allOperations = []string{
 	"list_custom_properties", "set_custom_properties",
 	// Generic API call (REST)
 	"api_call",
+	// State operations
+	"state_load", "state_save", "state_delete",
 }
 
 // readOperations are operations that return data (CapabilityFrom/Transform).
@@ -139,6 +141,7 @@ var readOperations = map[string]bool{
 	"list_environments":      true,
 	"list_topics":            true,
 	"list_custom_properties": true,
+	"state_load":             true,
 }
 
 // Provider implements GitHub API operations as a provider.
@@ -233,6 +236,7 @@ func newProvider(opts ...Option) *Provider {
 				sdkprovider.CapabilityFrom,
 				sdkprovider.CapabilityTransform,
 				sdkprovider.CapabilityAction,
+				sdkprovider.CapabilityState,
 			},
 			Schema: buildInputSchema(),
 			OutputSchemas: map[sdkprovider.Capability]*jsonschema.Schema{
@@ -247,10 +251,17 @@ func newProvider(opts ...Option) *Provider {
 					"result":    sdkhelper.AnyProp("The API response data -- structure varies by operation"),
 					"operation": sdkhelper.StringProp("The operation that was performed"),
 				}),
+				sdkprovider.CapabilityState: sdkhelper.ObjectSchema([]string{"success"}, map[string]*jsonschema.Schema{
+					"success":    sdkhelper.BoolProp("Whether the state operation succeeded"),
+					"data":       sdkhelper.AnyProp("The state data (for state_load)"),
+					"commit_oid": sdkhelper.StringProp("The OID of the commit created by state_save or state_delete"),
+				}),
 			},
 			Examples: buildExamples(),
 			Tags:     []string{"github", "api", "data", "graphql", "git"},
 			WriteOperations: []string{
+				// State mutations
+				"state_save", "state_delete",
 				// Review thread mutations
 				"reply_to_review_thread", "resolve_review_thread",
 				// Issue mutations
@@ -652,6 +663,14 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 	case "api_call":
 		result, err = p.executeAPICall(ctx, client, apiBase, inputs)
 
+	// --- State operations (GraphQL + createCommitOnBranch) ---
+	case "state_load":
+		result, err = p.executeStateLoad(ctx, client, apiBase, owner, repo, inputs)
+	case "state_save":
+		result, err = p.executeStateSave(ctx, client, apiBase, owner, repo, inputs)
+	case "state_delete":
+		result, err = p.executeStateDelete(ctx, client, apiBase, owner, repo, inputs)
+
 	default:
 		return nil, fmt.Errorf("%s: unknown operation %q -- supported: %s", ProviderName, operation, strings.Join(allOperations, ", "))
 	}
@@ -666,6 +685,23 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 
 // executeDryRun returns mock output without making API calls.
 func executeDryRun(operation string) (*sdkprovider.Output, error) {
+	// State operations return state-shaped output.
+	switch operation {
+	case "state_load":
+		return &sdkprovider.Output{
+			Data: map[string]any{
+				"success": true,
+				"data":    map[string]any{},
+			},
+		}, nil
+	case "state_save", "state_delete":
+		return &sdkprovider.Output{
+			Data: map[string]any{
+				"success": true,
+			},
+		}, nil
+	}
+
 	if readOperations[operation] {
 		return &sdkprovider.Output{
 			Data: map[string]any{
@@ -1173,6 +1209,9 @@ func buildInputSchema() *jsonschema.Schema {
 			),
 			"query_params": sdkhelper.ObjectProp("Query parameters for api_call", nil, nil),
 			"request_body": sdkhelper.ObjectProp("Request body (JSON object) for api_call POST/PUT/PATCH", nil, nil),
+
+			// --- State operation fields ---
+			"data": sdkhelper.AnyProp("State data to persist (for state_save)"),
 		},
 	)
 }
@@ -1234,6 +1273,27 @@ state: open`,
 			YAML: `operation: api_call
 endpoint: /repos/my-org/my-repo/labels
 method: GET`,
+		},
+		{
+			Name:        "Load state from GitHub",
+			Description: "Load persisted state from a JSON file in a repository",
+			YAML: `operation: state_load
+owner: my-org
+repo: my-state-repo
+path: state/my-app.json
+ref: main`,
+		},
+		{
+			Name:        "Save state to GitHub",
+			Description: "Persist state data as a JSON file via a signed commit",
+			YAML: `operation: state_save
+owner: my-org
+repo: my-state-repo
+path: state/my-app.json
+branch: main
+data:
+  app_name: my-app
+  last_run: "2025-01-01T00:00:00Z"`,
 		},
 	}
 }

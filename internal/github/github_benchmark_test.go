@@ -49,3 +49,61 @@ func BenchmarkProvider_Execute_CreateForkPR_DryRun(b *testing.B) {
 		_, _ = p.execute(ctx, inputs)
 	}
 }
+
+func BenchmarkProvider_Execute_StateLoad_DryRun(b *testing.B) {
+	p := newProvider()
+
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+	inputs := map[string]any{
+		"operation": "state_load",
+		"owner":     "example-org",
+		"repo":      "example-repo",
+		"path":      "state/app.json",
+		"ref":       "main",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = p.execute(ctx, inputs)
+	}
+}
+
+func BenchmarkProvider_Execute_StateSave_DryRun(b *testing.B) {
+	p := newProvider()
+
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+	inputs := map[string]any{
+		"operation": "state_save",
+		"owner":     "example-org",
+		"repo":      "example-repo",
+		"path":      "state/app.json",
+		"branch":    "main",
+		"data":      map[string]any{"key": "value"},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = p.execute(ctx, inputs)
+	}
+}
+
+func BenchmarkProvider_Execute_StateDelete_DryRun(b *testing.B) {
+	p := newProvider()
+
+	ctx := sdkprovider.WithDryRun(context.Background(), true)
+	inputs := map[string]any{
+		"operation": "state_delete",
+		"owner":     "example-org",
+		"repo":      "example-repo",
+		"path":      "state/app.json",
+		"branch":    "main",
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = p.execute(ctx, inputs)
+	}
+}
