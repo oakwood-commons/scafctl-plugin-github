@@ -86,6 +86,7 @@ func TestNewProvider(t *testing.T) {
 	assert.Contains(t, desc.Capabilities, sdkprovider.CapabilityFrom)
 	assert.Contains(t, desc.Capabilities, sdkprovider.CapabilityAction)
 	assert.Contains(t, desc.Capabilities, sdkprovider.CapabilityTransform)
+	assert.Contains(t, desc.Capabilities, sdkprovider.CapabilityState)
 
 	err := sdkprovider.ValidateDescriptor(desc)
 	assert.NoError(t, err)
