@@ -918,6 +918,25 @@ func (p *Provider) waitForForkReady(ctx context.Context, client *httpc.Client, a
 	return "", fmt.Errorf("fork not ready after %d attempts: %w", p.forkReadyMaxAttempts, lastErr)
 }
 
+// branchNotFoundError is returned when a branch (ref) does not exist on the
+// repository. It is a typed error so callers can distinguish a missing branch
+// (e.g. a first-time state save) from other failures via errors.As.
+type branchNotFoundError struct {
+	branch string
+	owner  string
+	repo   string
+}
+
+func (e *branchNotFoundError) Error() string {
+	return fmt.Sprintf("branch %q not found on %s/%s", e.branch, e.owner, e.repo)
+}
+
+// isBranchNotFound reports whether err indicates a missing branch.
+func isBranchNotFound(err error) bool {
+	var bnf *branchNotFoundError
+	return errors.As(err, &bnf)
+}
+
 // getHeadOID fetches the HEAD OID for a branch on a repository.
 func (p *Provider) getHeadOID(ctx context.Context, client *httpc.Client, apiBase, owner, repo, branch string) (string, error) {
 	query := `query($owner: String!, $name: String!, $qualifiedName: String!) {
@@ -937,7 +956,7 @@ func (p *Provider) getHeadOID(ctx context.Context, client *httpc.Client, apiBase
 		return "", err
 	}
 	if ref == nil {
-		return "", fmt.Errorf("branch %q not found on %s/%s", branch, owner, repo)
+		return "", &branchNotFoundError{branch: branch, owner: owner, repo: repo}
 	}
 	refMap, ok := ref.(map[string]any)
 	if !ok {
