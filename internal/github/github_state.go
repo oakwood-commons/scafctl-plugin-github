@@ -50,8 +50,10 @@ func (p *Provider) executeStateLoad(ctx context.Context, client *httpc.Client, a
 
 // ─── State Save ──────────────────────────────────────────────────────────────
 
-// executeStateSave persists state data as a JSON file by creating a signed
-// commit on the target branch. Uses optimistic locking via the branch HEAD OID.
+// executeStateSave persists state data as a JSON file by committing it to the
+// target branch. The normal path creates a GitHub-signed commit via the GraphQL
+// createCommitOnBranch mutation and uses optimistic locking via the branch HEAD
+// OID.
 //
 // On the first save the target branch may not exist yet. In that case the
 // branch is bootstrapped from a base ref (the optional "base_ref" input, or the
@@ -126,10 +128,10 @@ func (p *Provider) bootstrapStateSave(ctx context.Context, client *httpc.Client,
 	// Resolve the OID the new branch should point at.
 	var baseOID string
 	if baseRef != "" {
-		oid, err := p.getHeadOID(ctx, client, apiBase, owner, repo, baseRef)
+		oid, err := p.resolveBaseRefOID(ctx, client, apiBase, owner, repo, baseRef)
 		if err != nil {
 			if isBranchNotFound(err) {
-				return nil, fmt.Errorf("state_save: base_ref %q not found on %s/%s -- specify an existing branch to seed state from", baseRef, owner, repo)
+				return nil, fmt.Errorf("state_save: base_ref %q not found on %s/%s -- specify an existing branch, tag, or commit SHA to seed state from", baseRef, owner, repo)
 			}
 			return nil, fmt.Errorf("state_save: resolve base_ref %q: %w", baseRef, err)
 		}
@@ -169,7 +171,7 @@ func (p *Provider) seedStateOnEmptyRepo(ctx context.Context, client *httpc.Clien
 		return nil, fmt.Errorf("state_save: determine default branch for empty repo %s/%s: %w", owner, repo, err)
 	}
 
-	url := fmt.Sprintf("%s/repos/%s/%s/contents/%s", apiBase, owner, repo, escapeContentsPath(path))
+	restURL := fmt.Sprintf("%s/repos/%s/%s/contents/%s", apiBase, owner, repo, escapeContentsPath(path))
 	reqBody := map[string]any{
 		"message": message,
 		"content": base64.StdEncoding.EncodeToString(stateJSON),
@@ -180,7 +182,7 @@ func (p *Provider) seedStateOnEmptyRepo(ctx context.Context, client *httpc.Clien
 		reqBody["branch"] = branch
 	}
 
-	resp, err := p.doRESTRequest(ctx, client, http.MethodPut, url, reqBody)
+	resp, err := p.doRESTRequest(ctx, client, http.MethodPut, restURL, reqBody)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"state_save: initialize state on empty repository %s/%s (branch %q): %w -- "+

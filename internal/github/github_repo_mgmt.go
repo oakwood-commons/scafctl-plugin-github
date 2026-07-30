@@ -973,6 +973,136 @@ func (p *Provider) getHeadOID(ctx context.Context, client *httpc.Client, apiBase
 	return oid, nil
 }
 
+// resolveBaseRefOID resolves a base ref -- a branch name, a tag name, or a
+// commit SHA -- to a commit OID suitable for creating a new branch. It tries,
+// in order: the ref as a branch (refs/heads/<ref>), as a tag (refs/tags/<ref>,
+// peeling annotated tags to their underlying commit), and finally -- when the
+// ref is a full 40-character hex SHA -- as a commit object. It returns a
+// *branchNotFoundError when the ref cannot be resolved by any of these.
+func (p *Provider) resolveBaseRefOID(ctx context.Context, client *httpc.Client, apiBase, owner, repo, ref string) (string, error) {
+	query := `query($owner: String!, $name: String!, $branch: String!, $tag: String!) {
+  repository(owner: $owner, name: $name) {
+    branchRef: ref(qualifiedName: $branch) { target { oid } }
+    tagRef: ref(qualifiedName: $tag) {
+      target {
+        oid
+        ... on Tag { target { oid } }
+      }
+    }
+  }
+}`
+	vars := map[string]any{
+		"owner":  owner,
+		"name":   repo,
+		"branch": "refs/heads/" + ref,
+		"tag":    "refs/tags/" + ref,
+	}
+	data, err := graphqlDo(ctx, client, apiBase, query, vars)
+	if err != nil {
+		return "", err
+	}
+
+	// Prefer a branch match, then a tag match (peeled to the underlying commit).
+	if oid := oidFromRefTarget(data, "repository.branchRef", false); oid != "" {
+		return oid, nil
+	}
+	if oid := oidFromRefTarget(data, "repository.tagRef", true); oid != "" {
+		return oid, nil
+	}
+
+	// Finally, treat a full 40-character hex SHA as a commit OID and verify it
+	// exists in the repository before using it.
+	if isFullCommitSHA(ref) {
+		oid, err := p.resolveCommitOID(ctx, client, apiBase, owner, repo, ref)
+		if err != nil {
+			return "", err
+		}
+		if oid != "" {
+			return oid, nil
+		}
+	}
+
+	return "", &branchNotFoundError{branch: ref, owner: owner, repo: repo}
+}
+
+// oidFromRefTarget extracts the commit OID from a resolved ref target at the
+// given path. When peelTag is true and the target is an annotated tag (it has a
+// nested "target"), the underlying commit OID is returned instead of the tag
+// object OID. Returns "" when the ref did not resolve.
+func oidFromRefTarget(data map[string]any, path string, peelTag bool) string {
+	node, err := extractNode(data, path)
+	if err != nil || node == nil {
+		return ""
+	}
+	refMap, ok := node.(map[string]any)
+	if !ok {
+		return ""
+	}
+	target, ok := refMap["target"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	if peelTag {
+		if inner, ok := target["target"].(map[string]any); ok {
+			if oid, _ := inner["oid"].(string); oid != "" {
+				return oid
+			}
+		}
+	}
+	oid, _ := target["oid"].(string)
+	return oid
+}
+
+// resolveCommitOID verifies that oid refers to an existing commit in the
+// repository and returns its OID. It returns "" when the object does not exist
+// or is not a commit.
+func (p *Provider) resolveCommitOID(ctx context.Context, client *httpc.Client, apiBase, owner, repo, oid string) (string, error) {
+	query := `query($owner: String!, $name: String!, $oid: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $oid) {
+      __typename
+      ... on Commit { oid }
+    }
+  }
+}`
+	vars := map[string]any{"owner": owner, "name": repo, "oid": oid}
+	data, err := graphqlDo(ctx, client, apiBase, query, vars)
+	if err != nil {
+		return "", err
+	}
+	obj, err := extractNode(data, "repository.object")
+	if err != nil || obj == nil {
+		return "", nil
+	}
+	objMap, ok := obj.(map[string]any)
+	if !ok {
+		return "", nil
+	}
+	if t, _ := objMap["__typename"].(string); t != "Commit" {
+		return "", nil
+	}
+	commitOID, _ := objMap["oid"].(string)
+	return commitOID, nil
+}
+
+// isFullCommitSHA reports whether ref is a full 40-character lowercase-or-upper
+// hexadecimal SHA-1 commit identifier.
+func isFullCommitSHA(ref string) bool {
+	if len(ref) != 40 {
+		return false
+	}
+	for _, r := range ref {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // syncForkWithUpstream syncs the fork's branch with the upstream using the merge-upstream API.
 func (p *Provider) syncForkWithUpstream(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch string) error {
 	restURL := fmt.Sprintf("%s/repos/%s/%s/merge-upstream", apiBase, forkOrg, repo)
