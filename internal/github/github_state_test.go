@@ -467,6 +467,487 @@ func TestProvider_Execute_StateSave_CustomMessage(t *testing.T) {
 	assert.Equal(t, "chore: custom state message", commitMessage)
 }
 
+// ─── state_save first-save (branch bootstrap) tests ──────────────────────────
+
+// respondGQLData writes a successful GraphQL response with the given data node.
+func respondGQLData(w http.ResponseWriter, data map[string]any) {
+	json.NewEncoder(w).Encode(map[string]any{"data": data}) //nolint:errcheck,gosec
+}
+
+// respondGQLErrors writes a GraphQL error response with the given message.
+func respondGQLErrors(w http.ResponseWriter, message, errType string) {
+	json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+		"errors": []any{map[string]any{"message": message, "type": errType}},
+	})
+}
+
+func TestProvider_Execute_StateSave_FirstSave_CreatesBranchFromDefault(t *testing.T) {
+	t.Parallel()
+
+	const baseOID = "abc123def456abc123def456abc123def456abc1"
+	var createdBranchName string
+	var createdBranchOID string
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{
+				"defaultBranchRef": map[string]any{"target": map[string]any{"oid": baseOID}},
+			}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// The target state branch does not exist yet.
+			assert.Equal(t, "refs/heads/scafctl-state", req.Variables["qualifiedName"])
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "createRef"):
+			input := req.Variables["input"].(map[string]any)
+			createdBranchName, _ = input["name"].(string)
+			createdBranchOID, _ = input["oid"].(string)
+			respondGQLData(w, map[string]any{"createRef": map[string]any{"ref": map[string]any{
+				"name":   "refs/heads/scafctl-state",
+				"target": map[string]any{"oid": baseOID},
+			}}})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, baseOID, input["expectedHeadOid"])
+			branchInput := input["branch"].(map[string]any)
+			assert.Equal(t, "scafctl-state", branchInput["branchName"])
+			respondGQLData(w, map[string]any{"createCommitOnBranch": map[string]any{"commit": map[string]any{
+				"oid":     "newcommit00000000000000000000000000000001",
+				"url":     "https://github.com/test-org/state-repo/commit/newcommit01",
+				"message": "chore(state): update state",
+			}}})
+		default:
+			// resolveRepoID for createRef.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "newcommit00000000000000000000000000000001", result["commit_oid"])
+	assert.Equal(t, "refs/heads/scafctl-state", createdBranchName)
+	assert.Equal(t, baseOID, createdBranchOID)
+}
+
+func TestProvider_Execute_StateSave_FirstSave_WithBaseRef(t *testing.T) {
+	t.Parallel()
+
+	const baseOID = "dddd1111dddd1111dddd1111dddd1111dddd1111"
+	var defaultBranchQueried bool
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			defaultBranchQueried = true
+			respondGQLData(w, map[string]any{"repository": map[string]any{"defaultBranchRef": nil}})
+		case strings.Contains(req.Query, "branchRef"):
+			// base_ref resolution: "develop" resolves as a branch.
+			assert.Equal(t, "refs/heads/develop", req.Variables["branch"])
+			respondGQLData(w, map[string]any{"repository": map[string]any{
+				"branchRef": map[string]any{"target": map[string]any{"oid": baseOID}},
+				"tagRef":    nil,
+			}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// The target state branch does not exist yet.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "createRef"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, baseOID, input["oid"])
+			respondGQLData(w, map[string]any{"createRef": map[string]any{"ref": map[string]any{
+				"name":   "refs/heads/scafctl-state",
+				"target": map[string]any{"oid": baseOID},
+			}}})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, baseOID, input["expectedHeadOid"])
+			respondGQLData(w, map[string]any{"createCommitOnBranch": map[string]any{"commit": map[string]any{
+				"oid": "committedfrombaseref000000000000000000001",
+			}}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"base_ref":  "develop",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "committedfrombaseref000000000000000000001", result["commit_oid"])
+	assert.False(t, defaultBranchQueried, "default branch must not be queried when base_ref is provided")
+}
+
+func TestProvider_Execute_StateSave_FirstSave_BaseRefNotFound(t *testing.T) {
+	t.Parallel()
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "branchRef"):
+			// base_ref "nonexistent" is neither a branch nor a tag.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"branchRef": nil, "tagRef": nil}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// The target state branch does not exist.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	_, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"base_ref":  "nonexistent",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "base_ref \"nonexistent\" not found")
+}
+
+func TestProvider_Execute_StateSave_FirstSave_WithBaseRef_Tag(t *testing.T) {
+	t.Parallel()
+
+	// Annotated tag: the tag object OID differs from the underlying commit OID,
+	// which is what the new branch must point at.
+	const commitOID = "cccc3333cccc3333cccc3333cccc3333cccc3333"
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "branchRef"):
+			// base_ref "v1.0.0" is not a branch but resolves as an annotated tag
+			// whose target peels to the commit OID.
+			assert.Equal(t, "refs/tags/v1.0.0", req.Variables["tag"])
+			respondGQLData(w, map[string]any{"repository": map[string]any{
+				"branchRef": nil,
+				"tagRef": map[string]any{"target": map[string]any{
+					"oid":    "tagobject00000000000000000000000000000001",
+					"target": map[string]any{"oid": commitOID},
+				}},
+			}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "createRef"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, commitOID, input["oid"], "branch must be created from the peeled commit OID")
+			respondGQLData(w, map[string]any{"createRef": map[string]any{"ref": map[string]any{
+				"name":   "refs/heads/scafctl-state",
+				"target": map[string]any{"oid": commitOID},
+			}}})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, commitOID, input["expectedHeadOid"])
+			respondGQLData(w, map[string]any{"createCommitOnBranch": map[string]any{"commit": map[string]any{
+				"oid": "committedfromtag0000000000000000000000001",
+			}}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"base_ref":  "v1.0.0",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "committedfromtag0000000000000000000000001", result["commit_oid"])
+}
+
+func TestProvider_Execute_StateSave_FirstSave_WithBaseRef_CommitSHA(t *testing.T) {
+	t.Parallel()
+
+	const commitSHA = "abcdef0123456789abcdef0123456789abcdef01"
+	var objectQueried bool
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "object(oid"):
+			// SHA fallback: base_ref is neither branch nor tag, resolved as commit.
+			objectQueried = true
+			assert.Equal(t, commitSHA, req.Variables["oid"])
+			respondGQLData(w, map[string]any{"repository": map[string]any{"object": map[string]any{
+				"__typename": "Commit",
+				"oid":        commitSHA,
+			}}})
+		case strings.Contains(req.Query, "branchRef"):
+			// base_ref SHA is neither a branch nor a tag.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"branchRef": nil, "tagRef": nil}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "createRef"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, commitSHA, input["oid"])
+			respondGQLData(w, map[string]any{"createRef": map[string]any{"ref": map[string]any{
+				"name":   "refs/heads/scafctl-state",
+				"target": map[string]any{"oid": commitSHA},
+			}}})
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, commitSHA, input["expectedHeadOid"])
+			respondGQLData(w, map[string]any{"createCommitOnBranch": map[string]any{"commit": map[string]any{
+				"oid": "committedfromsha00000000000000000000000001",
+			}}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"base_ref":  commitSHA,
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "committedfromsha00000000000000000000000001", result["commit_oid"])
+	assert.True(t, objectQueried, "a full SHA base_ref must be verified via object(oid:)")
+}
+
+func TestProvider_Execute_StateSave_FirstSave_BranchAlreadyExistsRace(t *testing.T) {
+	t.Parallel()
+
+	const existingOID = "eeee2222eeee2222eeee2222eeee2222eeee2222"
+	var branchRefQueries atomic.Int32
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "viewerPermission"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"viewerPermission": "ADMIN"}})
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{
+				"defaultBranchRef": map[string]any{"target": map[string]any{"oid": "0000000000000000000000000000000000000000"}},
+			}})
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// First query: branch missing. Second query (after createRef
+			// already-exists): branch now present with its own HEAD.
+			if branchRefQueries.Add(1) == 1 {
+				respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+				return
+			}
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": map[string]any{
+				"target": map[string]any{"oid": existingOID},
+			}}})
+		case strings.Contains(req.Query, "createRef"):
+			respondGQLErrors(w, "A ref named refs/heads/scafctl-state already exists in the repository.", "UNPROCESSABLE")
+		case strings.Contains(req.Query, "createCommitOnBranch"):
+			input := req.Variables["input"].(map[string]any)
+			assert.Equal(t, existingOID, input["expectedHeadOid"])
+			respondGQLData(w, map[string]any{"createCommitOnBranch": map[string]any{"commit": map[string]any{
+				"oid": "raceresolvedcommit0000000000000000000001",
+			}}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "raceresolvedcommit0000000000000000000001", result["commit_oid"])
+	assert.Equal(t, int32(2), branchRefQueries.Load())
+}
+
+func TestProvider_Execute_StateSave_FirstSave_EmptyRepo_DefaultBranch(t *testing.T) {
+	t.Parallel()
+
+	var putBody map[string]any
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		// REST endpoints.
+		if r.URL.Path == "/repos/test-org/state-repo" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"default_branch": "main"}) //nolint:errcheck,gosec
+			return
+		}
+		if r.URL.Path == "/repos/test-org/state-repo/contents/state/app.json" && r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			json.Unmarshal(body, &putBody) //nolint:errcheck,gosec
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"commit": map[string]any{"sha": "emptyrepobootstrapsha000000000000000001"},
+			})
+			return
+		}
+
+		// GraphQL endpoint.
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			// Branch does not exist (empty repo).
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			// Empty repo -- no default branch ref.
+			respondGQLData(w, map[string]any{"repository": map[string]any{"defaultBranchRef": nil}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "main",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, output)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "emptyrepobootstrapsha000000000000000001", result["commit_oid"])
+	require.NotNil(t, putBody)
+	assert.NotContains(t, putBody, "branch", "branch must be omitted when it equals the default branch on an empty repo")
+	assert.NotEmpty(t, putBody["content"], "state content must be sent")
+}
+
+func TestProvider_Execute_StateSave_FirstSave_EmptyRepo_CustomBranchError(t *testing.T) {
+	t.Parallel()
+
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/test-org/state-repo" && r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]any{"default_branch": "main"}) //nolint:errcheck,gosec
+			return
+		}
+		if r.URL.Path == "/repos/test-org/state-repo/contents/state/app.json" && r.Method == http.MethodPut {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			json.NewEncoder(w).Encode(map[string]any{"message": "Branch scafctl-state not found"}) //nolint:errcheck,gosec
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		switch {
+		case strings.Contains(req.Query, "ref(qualifiedName"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"ref": nil}})
+		case strings.Contains(req.Query, "defaultBranchRef"):
+			respondGQLData(w, map[string]any{"repository": map[string]any{"defaultBranchRef": nil}})
+		default:
+			respondGQLData(w, map[string]any{"repository": map[string]any{"id": "R_repo123"}})
+		}
+	})
+
+	_, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "scafctl-state",
+		"data":      map[string]any{"k": "v"},
+		"api_base":  baseURL,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "has no commits yet")
+	assert.Contains(t, err.Error(), "scafctl-state")
+	assert.Contains(t, err.Error(), "main")
+}
+
 // ─── state_delete tests ──────────────────────────────────────────────────────
 
 func TestProvider_Execute_StateDelete_FileExists(t *testing.T) {
