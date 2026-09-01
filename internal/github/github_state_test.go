@@ -283,6 +283,83 @@ func TestProvider_Execute_StateSave_Success(t *testing.T) {
 	assert.Equal(t, int32(2), callCount.Load())
 }
 
+func TestProvider_Execute_StateSave_PartialDataReturnsSuccess(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int32
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "viewerPermission") {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{"viewerPermission": "ADMIN"},
+				},
+			})
+			return
+		}
+
+		n := callCount.Add(1)
+		switch n {
+		case 1:
+			// getHeadOID
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{
+								"oid": "abc123def456789012345678901234567890abcd",
+							},
+						},
+					},
+				},
+			})
+		case 2:
+			// createCommitOnBranch returns commit data alongside a field-level
+			// FORBIDDEN error -- the mutation applied and must be treated as
+			// success, not replayed.
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"createCommitOnBranch": map[string]any{
+						"commit": map[string]any{
+							"oid":     "new123abc456",
+							"url":     "https://github.com/test-org/state-repo/commit/new123abc456",
+							"message": "chore(state): update state",
+						},
+					},
+				},
+				"errors": []any{
+					map[string]any{
+						"message": "Resource not accessible by personal access token",
+						"type":    "FORBIDDEN",
+						"path":    []any{"createCommitOnBranch", "commit", "signature", "signer"},
+					},
+				},
+			})
+		}
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation": "state_save",
+		"owner":     "test-org",
+		"repo":      "state-repo",
+		"path":      "state/app.json",
+		"branch":    "main",
+		"data":      map[string]any{"key": "value"},
+		"api_base":  baseURL,
+	})
+
+	require.NoError(t, err)
+	result := output.Data.(map[string]any)
+	assert.Equal(t, true, result["success"])
+	assert.Equal(t, "new123abc456", result["commit_oid"])
+	assert.Equal(t, int32(2), callCount.Load())
+}
+
 func TestProvider_Execute_StateSave_OIDConflict(t *testing.T) {
 	t.Parallel()
 

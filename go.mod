@@ -1,11 +1,12 @@
 module github.com/oakwood-commons/scafctl-plugin-github
 
-go 1.26.5
+go 1.26.6
 
 require (
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/go-logr/logr v1.4.4
 	github.com/google/jsonschema-go v0.4.3
+	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/oakwood-commons/httpc v0.2.0
 	github.com/oakwood-commons/scafctl-plugin-sdk v0.17.0
 	github.com/stretchr/testify v1.11.1
@@ -24,7 +25,6 @@ require (
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
 	github.com/hashicorp/go-hclog v1.6.3 // indirect
 	github.com/hashicorp/go-plugin v1.8.0 // indirect
-	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/yamux v0.1.2 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect

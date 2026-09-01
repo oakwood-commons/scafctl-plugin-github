@@ -1157,13 +1157,25 @@ func isBranchAlreadyExists(err error) bool {
 	return strings.Contains(msg, "already exists") || strings.Contains(msg, "reference already exists")
 }
 
-// commitWithRetry commits to the fork with FORBIDDEN retry logic for permission propagation.
-func (p *Provider) commitWithRetry(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch, message, expectedOID string, additions []fileAddition, deletions []fileDeletion, inputs map[string]any) (*sdkprovider.Output, error) {
+// commitWithRetry commits with FORBIDDEN retry logic for permission
+// propagation. Before any retry it re-reads the branch HEAD: if HEAD no
+// longer equals expectedOID, the previous mutation may have already applied,
+// so it stops rather than replaying a non-idempotent mutation with a stale
+// optimistic lock.
+func (p *Provider) commitWithRetry(ctx context.Context, client *httpc.Client, apiBase, owner, repo, branch, message, expectedOID string, additions []fileAddition, deletions []fileDeletion, inputs map[string]any) (*sdkprovider.Output, error) {
 	lgr := logr.FromContextOrDiscard(ctx)
 	var lastErr error
 
 	for attempt := range p.commitMaxAttempts {
 		if attempt > 0 {
+			currentOID, headErr := p.getHeadOID(ctx, client, apiBase, owner, repo, branch)
+			if headErr != nil {
+				return nil, fmt.Errorf("commit outcome is ambiguous after a FORBIDDEN response: could not verify branch %q HEAD before retrying: %w (original error: %w)", branch, headErr, lastErr)
+			}
+			if currentOID != expectedOID {
+				return nil, fmt.Errorf("commit outcome is ambiguous after a FORBIDDEN response: branch %q HEAD moved from %s to %s, so the previous mutation may have already applied; verify the branch before retrying (original error: %w)", branch, expectedOID, currentOID, lastErr)
+			}
+
 			delay := time.Duration(attempt) * p.commitRetryBackoff
 			lgr.V(1).Info("retrying commit after FORBIDDEN", "attempt", attempt+1, "delay", delay)
 			timer := time.NewTimer(delay)
@@ -1175,7 +1187,7 @@ func (p *Provider) commitWithRetry(ctx context.Context, client *httpc.Client, ap
 			}
 		}
 
-		output, err := p.executeCreateCommitGraphQL(ctx, client, apiBase, forkOrg, repo, branch, message, expectedOID, additions, deletions, inputs)
+		output, err := p.executeCreateCommitGraphQL(ctx, client, apiBase, owner, repo, branch, message, expectedOID, additions, deletions, inputs)
 		if err == nil {
 			return output, nil
 		}

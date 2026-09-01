@@ -43,6 +43,13 @@ type gqlLocation struct {
 	Column int `json:"column"`
 }
 
+type graphqlMutationContextKey struct{}
+
+func isGraphQLMutation(ctx context.Context) bool {
+	isMutation, _ := ctx.Value(graphqlMutationContextKey{}).(bool)
+	return isMutation
+}
+
 // Error implements the error interface for graphqlError.
 func (e graphqlError) Error() string {
 	var sb strings.Builder
@@ -109,7 +116,11 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 		return nil, fmt.Errorf("marshaling GraphQL request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
+	requestCtx := ctx
+	if strings.HasPrefix(strings.TrimSpace(query), "mutation") {
+		requestCtx = context.WithValue(ctx, graphqlMutationContextKey{}, true)
+	}
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("creating GraphQL request: %w", err)
 	}
@@ -152,7 +163,7 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 		if gqlResp.Data != nil {
 			lgr.V(1).Info("GraphQL response contains partial data with errors", "errorCount", len(gqlResp.Errors))
 		}
-		return nil, &GraphQLError{Errors: gqlResp.Errors}
+		return gqlResp.Data, &GraphQLError{Errors: gqlResp.Errors}
 	}
 
 	if gqlResp.Data == nil {
