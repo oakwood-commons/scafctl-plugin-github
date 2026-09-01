@@ -8,6 +8,9 @@ vars:
   VERSION: '{{default "" .VERSION}}'
   EXE: '{{if eq OS "windows"}}.exe{{end}}'
 
+env:
+  CGO_ENABLED: "0"
+
 tasks:
   default:
     cmds:
@@ -15,8 +18,6 @@ tasks:
 
   build:
     desc: Build the plugin binary
-    env:
-      CGO_ENABLED: "0"
     sources:
       - "**/*.go"
       - go.mod
@@ -29,38 +30,6 @@ tasks:
         go build -ldflags "-s -w{{if .VERSION}} -X github.com/oakwood-commons/scafctl-plugin-github/internal/github.version={{.VERSION}}{{end}}"
         -o {{.DIST}}/{{.BINARY}}{{.EXE}}
         ./cmd/{{.BINARY}}/
-
-  publish:local:
-    desc: Build and install the plugin into the local catalog
-    deps: [build]
-    cmds:
-      - >-
-        {{.CLI}} build plugin --force
-        --name github
-        --kind provider
-        --version {{default "0.1.0" .VERSION}}
-        --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}{{.EXE}}
-
-  release:tag:
-    desc: "Create and push a signed release tag (usage: task release:tag VERSION=0.1.1)"
-    requires:
-      vars: [VERSION]
-    cmds:
-      - git tag -s v{{.VERSION}} -m "v{{.VERSION}}"
-      - git push origin v{{.VERSION}}
-
-  release:local:
-    desc: "Build and install a versioned local catalog artifact (usage: task release:local VERSION=0.1.1)"
-    requires:
-      vars: [VERSION]
-    deps: [build]
-    cmds:
-      - >-
-        {{.CLI}} build plugin --force
-        --name github
-        --kind provider
-        --version {{.VERSION}}
-        --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}{{.EXE}}
 
   test:
     desc: Run tests
@@ -106,3 +75,36 @@ tasks:
       - task: lint
       - task: test
       - task: build
+
+  publish:local:
+    desc: Build and install the plugin into the local catalog
+    deps: [build]
+    cmds:
+      - >-
+        {{.CLI}} build plugin --force
+        --name github
+        --kind provider
+        --version {{default "0.1.0" .VERSION}}
+        --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}{{.EXE}}
+
+  release:tag:
+    desc: "Create and push a signed release tag (usage: task release:tag VERSION=1.2.3)"
+    prompt: "This will create and push tag v{{.VERSION}} to origin. Continue?"
+    requires:
+      vars: [VERSION]
+    cmds:
+      - git tag -s v{{.VERSION}} -m "v{{.VERSION}}"
+      - git push origin v{{.VERSION}}
+
+  release:local:
+    desc: "Build and install a versioned local catalog artifact (usage: task release:local VERSION=1.2.3)"
+    requires:
+      vars: [VERSION]
+    deps: [build]
+    cmds:
+      - >-
+        {{.CLI}} build plugin --force
+        --name github
+        --kind provider
+        --version {{.VERSION}}
+        --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}{{.EXE}}
