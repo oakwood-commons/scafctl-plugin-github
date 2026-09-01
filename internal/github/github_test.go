@@ -638,6 +638,124 @@ func TestProvider_Execute_CreateCommit(t *testing.T) {
 	assert.Equal(t, true, sig["isValid"])
 }
 
+func TestProvider_Execute_CreateCommit_PartialDataReturnsSuccess(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int32
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, _ *http.Request) {
+		callCount.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+			"data": map[string]any{
+				"createCommitOnBranch": map[string]any{
+					"commit": map[string]any{
+						"oid":     "new456def",
+						"url":     "https://github.com/test-org/test-repo/commit/new456def",
+						"message": "feat: add files",
+						"signature": map[string]any{
+							"isValid": true,
+							"signer":  nil,
+						},
+					},
+				},
+			},
+			"errors": []any{
+				map[string]any{
+					"message": "Resource not accessible by personal access token",
+					"type":    "FORBIDDEN",
+					"path":    []any{"createCommitOnBranch", "commit", "signature", "signer"},
+				},
+			},
+		})
+	})
+
+	output, err := p.execute(context.Background(), map[string]any{
+		"operation":         "create_commit",
+		"owner":             "test-org",
+		"repo":              "test-repo",
+		"branch":            "feature",
+		"message":           "feat: add files",
+		"expected_head_oid": "abc123def456789012345678901234567890abcd",
+		"additions": []any{
+			map[string]any{"path": "src/main.go", "content": "package main"},
+		},
+		"api_base": baseURL,
+	})
+
+	require.NoError(t, err)
+	result := output.Data.(map[string]any)["result"].(map[string]any)
+	assert.Equal(t, "new456def", result["oid"])
+	assert.Equal(t, int32(1), callCount.Load())
+}
+
+func TestProvider_Execute_CreateCommit_HTTPErrorDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount.Add(1)
+		http.Error(w, "server error", http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	p := newProvider()
+	p.allowPrivateIPs = true
+	p.getClient().RetryableClient().RetryWaitMin = time.Millisecond
+	p.getClient().RetryableClient().RetryWaitMax = time.Millisecond
+
+	_, err := p.execute(context.Background(), map[string]any{
+		"operation":         "create_commit",
+		"owner":             "test-org",
+		"repo":              "test-repo",
+		"branch":            "feature",
+		"message":           "feat: add files",
+		"expected_head_oid": "abc123def456789012345678901234567890abcd",
+		"additions": []any{
+			map[string]any{"path": "src/main.go", "content": "package main"},
+		},
+		"api_base": server.URL,
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, int32(1), callCount.Load())
+}
+
+func TestProvider_Execute_CreateCommit_DroppedResponseDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	var callCount atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		callCount.Add(1)
+		hijacker, ok := w.(http.Hijacker)
+		require.True(t, ok)
+		conn, _, err := hijacker.Hijack()
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+	}))
+	t.Cleanup(server.Close)
+
+	p := newProvider()
+	p.allowPrivateIPs = true
+	p.getClient().RetryableClient().RetryWaitMin = time.Millisecond
+	p.getClient().RetryableClient().RetryWaitMax = time.Millisecond
+
+	_, err := p.execute(context.Background(), map[string]any{
+		"operation":         "create_commit",
+		"owner":             "test-org",
+		"repo":              "test-repo",
+		"branch":            "feature",
+		"message":           "feat: add files",
+		"expected_head_oid": "abc123def456789012345678901234567890abcd",
+		"additions": []any{
+			map[string]any{"path": "src/main.go", "content": "package main"},
+		},
+		"api_base": server.URL,
+	})
+
+	require.Error(t, err)
+	assert.Equal(t, int32(1), callCount.Load())
+}
+
 func TestProvider_Execute_CreateCommit_MissingFields(t *testing.T) {
 	p := newProvider()
 
@@ -763,6 +881,21 @@ func TestProvider_Execute_CreateCommit_RetryOnForbidden(t *testing.T) {
 			return
 		}
 
+		// Between FORBIDDEN attempts the provider re-reads HEAD to confirm
+		// the previous mutation did not apply before it retries.
+		if strings.Contains(req.Query, "ref(qualifiedName:") {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{
+							"target": map[string]any{"oid": "abc123def456789012345678901234567890abcd"},
+						},
+					},
+				},
+			})
+			return
+		}
+
 		n := callCount.Add(1)
 		if n < 3 {
 			// First two attempts: FORBIDDEN
@@ -806,6 +939,62 @@ func TestProvider_Execute_CreateCommit_RetryOnForbidden(t *testing.T) {
 	data := output.Data.(map[string]any)
 	assert.Equal(t, true, data["success"])
 	assert.Equal(t, int32(3), callCount.Load())
+}
+
+func TestProvider_Execute_CreateCommit_HeadChangedAfterForbiddenDoesNotRetry(t *testing.T) {
+	t.Parallel()
+
+	var mutationCount atomic.Int32
+	p, baseURL := testProvider(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req graphqlRequest
+		json.Unmarshal(body, &req) //nolint:errcheck,gosec
+		w.Header().Set("Content-Type", "application/json")
+
+		if strings.Contains(req.Query, "ref(qualifiedName:") {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"data": map[string]any{
+					"repository": map[string]any{
+						"ref": map[string]any{"target": map[string]any{"oid": "new789"}},
+					},
+				},
+			})
+			return
+		}
+
+		if mutationCount.Add(1) == 1 {
+			json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+				"errors": []any{
+					map[string]any{
+						"message": "Resource not accessible by personal access token",
+						"type":    "FORBIDDEN",
+					},
+				},
+			})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]any{ //nolint:errcheck,gosec
+			"errors": []any{
+				map[string]any{"message": "Expected branch to point to the old OID", "type": "STALE_DATA"},
+			},
+		})
+	})
+
+	_, err := p.execute(context.Background(), map[string]any{
+		"operation":         "create_commit",
+		"owner":             "test-org",
+		"repo":              "test-repo",
+		"branch":            "main",
+		"message":           "test commit",
+		"expected_head_oid": "abc123def456789012345678901234567890abcd",
+		"additions":         []any{map[string]any{"path": "f.go", "content": "pkg"}},
+		"api_base":          baseURL,
+	})
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "outcome is ambiguous")
+	assert.Equal(t, int32(1), mutationCount.Load())
 }
 
 func TestProvider_Execute_CreateCommit_NonForbiddenError_NoRetry(t *testing.T) {

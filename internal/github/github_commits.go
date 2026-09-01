@@ -7,10 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"time"
 
-	"github.com/oakwood-commons/httpc"
 	"github.com/go-logr/logr"
+	"github.com/oakwood-commons/httpc"
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
 )
 
@@ -22,9 +21,9 @@ import (
 // Supports multi-file atomic commits with additions and deletions.
 //
 // On freshly created repositories, the user's push permissions may not be
-// fully propagated in the GraphQL layer yet (FORBIDDEN). The function retries
-// up to p.commitMaxAttempts times with backoff to handle this eventual
-// consistency window.
+// fully propagated in the GraphQL layer yet (FORBIDDEN). A retry is attempted
+// only when a fresh read of the branch HEAD still matches expected_head_oid,
+// so a mutation that already applied is never replayed. See commitWithRetry.
 func (p *Provider) executeCreateCommit(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
 	branch := getStringInput(inputs, "branch")
 	if branch == "" {
@@ -47,40 +46,7 @@ func (p *Provider) executeCreateCommit(ctx context.Context, client *httpc.Client
 		return nil, fmt.Errorf("create_commit requires at least one 'additions' or 'deletions' entry")
 	}
 
-	// Retry on FORBIDDEN — when a repo was just created, GraphQL write
-	// permissions may take a few seconds to propagate.
-	lgr := logr.FromContextOrDiscard(ctx)
-	var lastErr error
-	for attempt := range p.commitMaxAttempts {
-		if attempt > 0 {
-			delay := time.Duration(attempt) * p.commitRetryBackoff
-			lgr.V(1).Info("retrying createCommitOnBranch after FORBIDDEN",
-				"attempt", attempt+1,
-				"delay", delay,
-				"owner", owner,
-				"repo", repo,
-			)
-			timer := time.NewTimer(delay)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return nil, ctx.Err()
-			case <-timer.C:
-			}
-		}
-
-		output, err := p.executeCreateCommitGraphQL(ctx, client, apiBase, owner, repo, branch, message, expectedHeadOID, additions, deletions, inputs)
-		if err == nil {
-			return output, nil
-		}
-		lastErr = err
-
-		// Only retry on FORBIDDEN (permission propagation)
-		if !isGraphQLForbidden(err) {
-			return nil, err
-		}
-	}
-	return nil, lastErr
+	return p.commitWithRetry(ctx, client, apiBase, owner, repo, branch, message, expectedHeadOID, additions, deletions, inputs)
 }
 
 // fileAddition holds a parsed addition entry.
@@ -193,7 +159,12 @@ func (p *Provider) executeCreateCommitGraphQL(
 
 	data, err := graphqlDo(ctx, client, apiBase, mutation, map[string]any{"input": mutInput})
 	if err != nil {
-		return nil, err
+		commit, extractErr := extractNodeMap(data, "createCommitOnBranch.commit")
+		if extractErr != nil || getStringInput(commit, "oid") == "" {
+			return nil, err
+		}
+		logr.FromContextOrDiscard(ctx).V(1).Info("createCommitOnBranch returned commit data with GraphQL errors", "oid", commit["oid"], "error", err)
+		return actionOutput("create_commit", commit), nil
 	}
 
 	commit, err := extractNodeMap(data, "createCommitOnBranch.commit")

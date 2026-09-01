@@ -28,6 +28,7 @@ import (
 	"github.com/Masterminds/semver/v3"
 	"github.com/go-logr/logr"
 	"github.com/google/jsonschema-go/jsonschema"
+	"github.com/hashicorp/go-retryablehttp"
 
 	"github.com/oakwood-commons/httpc"
 
@@ -403,6 +404,12 @@ func (p *Provider) getClient() *httpc.Client {
 	cfg := httpc.DefaultConfig()
 	cfg.EnableCache = false
 	cfg.AllowPrivateIPs = p.allowPrivateIPs
+	cfg.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if isGraphQLMutation(ctx) {
+			return false, nil
+		}
+		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	}
 	cfg.OnUnauthorized = func(innerCtx context.Context) (string, error) {
 		hostClient := sdkplugin.HostClientFromContext(innerCtx)
 		if hostClient == nil {
