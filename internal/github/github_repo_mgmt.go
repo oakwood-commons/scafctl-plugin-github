@@ -1170,10 +1170,10 @@ func (p *Provider) commitWithRetry(ctx context.Context, client *httpc.Client, ap
 		if attempt > 0 {
 			currentOID, headErr := p.getHeadOID(ctx, client, apiBase, owner, repo, branch)
 			if headErr != nil {
-				return nil, fmt.Errorf("create_commit outcome is ambiguous after a FORBIDDEN response: could not verify branch %q HEAD before retrying: %w (original error: %w)", branch, headErr, lastErr)
+				return nil, fmt.Errorf("commit outcome is ambiguous after a FORBIDDEN response: could not verify branch %q HEAD before retrying: %w (original error: %w)", branch, headErr, lastErr)
 			}
 			if currentOID != expectedOID {
-				return nil, fmt.Errorf("create_commit outcome is ambiguous after a FORBIDDEN response: branch %q HEAD moved from %s to %s, so the previous mutation may have already applied; verify the branch before retrying (original error: %w)", branch, expectedOID, currentOID, lastErr)
+				return nil, fmt.Errorf("commit outcome is ambiguous after a FORBIDDEN response: branch %q HEAD moved from %s to %s, so the previous mutation may have already applied; verify the branch before retrying (original error: %w)", branch, expectedOID, currentOID, lastErr)
 			}
 
 			delay := time.Duration(attempt) * p.commitRetryBackoff
