@@ -88,7 +88,8 @@ tasks:
         --platform {{OS}}/{{ARCH}}={{.DIST}}/{{.BINARY}}{{.EXE}}
 
   release:tag:
-    desc: "Create and push a signed release tag (usage: task release:tag VERSION=0.4.0)"
+    desc: "Create and push a signed release tag (usage: task release:tag VERSION=1.2.3)"
+    prompt: "This will create and push tag v{{.VERSION}} to origin. Continue?"
     requires:
       vars: [VERSION]
     cmds:
@@ -96,7 +97,7 @@ tasks:
       - git push origin v{{.VERSION}}
 
   release:local:
-    desc: "Build and install a versioned local catalog artifact (usage: task release:local VERSION=0.4.0)"
+    desc: "Build and install a versioned local catalog artifact (usage: task release:local VERSION=1.2.3)"
     requires:
       vars: [VERSION]
     deps: [build]
