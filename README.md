@@ -18,6 +18,9 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) plugin that provides the
 ### Write Operations
 `create_issue`, `update_issue`, `create_issue_comment`, `create_pull_request`, `update_pull_request`, `merge_pull_request`, `close_pull_request`, `create_commit`, `create_branch`, `delete_branch`, `create_tag`, `delete_tag`, `create_release`, `update_release`, `delete_release`, `create_repo`, `update_repo`, `create_ruleset`, `enable_vulnerability_alerts`, `enable_automated_security_fixes`, `create_label`, `update_label`, `delete_label`, `add_labels_to_issue`, `remove_label_from_issue`, `create_milestone`, `update_milestone`, `delete_milestone`, `add_reaction`, `delete_reaction`, `add_collaborator`, `remove_collaborator`, `create_webhook`, `update_webhook`, `delete_webhook`, `dispatch_workflow`, `cancel_workflow_run`, `rerun_workflow`, `create_or_update_variable`, `delete_variable`, `create_or_update_environment`, `delete_environment`, `replace_topics`, `fork_repo`, `create_from_template`, `set_custom_properties`, `reply_to_review_thread`, `resolve_review_thread`
 
+### Compound Operations
+`create_fork_pr` -- fork a repository, sync it with upstream, create a branch, commit files, and open a cross-repo pull request in a single action
+
 ### Generic
 `api_call` -- call any GitHub REST endpoint
 
@@ -62,6 +65,29 @@ actions:
       additions:
         - path: src/main.go
           content: "package main\n\nfunc main() {}\n"
+```
+
+```yaml
+# Fork a repository, commit to it, and open a cross-repo pull request
+actions:
+  - provider: github
+    inputs:
+      operation: create_fork_pr
+      owner: upstream-org
+      repo: upstream-repo
+      fork_org: my-fork-org
+      # Optional: name the fork explicitly, so forks of different
+      # upstreams that share a name (upstream-a/config and
+      # upstream-b/config) can coexist in one destination org.
+      # Defaults to the upstream repo name. If a fork of this upstream
+      # already exists in fork_org under a different name, GitHub returns
+      # that existing fork and its name is used instead.
+      fork_repo_name: upstream-repo-my-app
+      branch: feat/add-config
+      message: "feat: add config"
+      additions:
+        - path: config.yaml
+          content: "key: value\n"
 ```
 
 ```yaml

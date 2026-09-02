@@ -92,6 +92,65 @@ func TestNewProvider(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+func TestPlugin_DescribeWhatIf(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		inputs map[string]any
+		want   string
+	}{
+		{
+			name:   "plain operation names the repo it writes to",
+			inputs: map[string]any{"operation": "create_issue", "owner": "my-org", "repo": "my-repo"},
+			want:   "Would perform GitHub create_issue on my-org/my-repo",
+		},
+		{
+			name: "create_fork_pr names the fork it writes to",
+			inputs: map[string]any{
+				"operation": "create_fork_pr",
+				"owner":     "upstream-org",
+				"repo":      "upstream-repo",
+				"fork_org":  "my-fork-org",
+			},
+			want: "Would perform GitHub create_fork_pr on upstream-org/upstream-repo via fork my-fork-org/upstream-repo",
+		},
+		{
+			name: "create_fork_pr honours an explicit fork name",
+			inputs: map[string]any{
+				"operation":      "create_fork_pr",
+				"owner":          "upstream-org",
+				"repo":           "upstream-repo",
+				"fork_org":       "my-fork-org",
+				"fork_repo_name": "renamed-repo",
+			},
+			want: "Would perform GitHub create_fork_pr on upstream-org/upstream-repo via fork my-fork-org/renamed-repo",
+		},
+		{
+			name:   "create_fork_pr without fork_org falls back to the plain form",
+			inputs: map[string]any{"operation": "create_fork_pr", "owner": "upstream-org", "repo": "upstream-repo"},
+			want:   "Would perform GitHub create_fork_pr on upstream-org/upstream-repo",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := NewPlugin().DescribeWhatIf(context.Background(), ProviderName, tc.inputs)
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+func TestPlugin_DescribeWhatIf_UnknownProvider(t *testing.T) {
+	t.Parallel()
+
+	_, err := NewPlugin().DescribeWhatIf(context.Background(), "not-github", map[string]any{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown provider")
+}
+
 func TestWithRetryConfig_ClampsValues(t *testing.T) {
 	t.Parallel()
 
