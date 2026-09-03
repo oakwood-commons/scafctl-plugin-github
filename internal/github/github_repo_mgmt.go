@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -684,6 +685,14 @@ func (p *Provider) executeCreateForkPR(ctx context.Context, client *httpc.Client
 	if forkOrg == "" {
 		return nil, requiredInputError("create_fork_pr", "fork_org", inputs, "organization to fork into")
 	}
+	// The fork can be given an explicit name at fork time, so that forks of
+	// different upstreams that happen to share a name can coexist in one
+	// destination org. Everything on the fork side below therefore uses
+	// forkRepoName, not repo.
+	forkRepoName := getStringInput(inputs, "fork_repo_name")
+	if forkRepoName == "" {
+		forkRepoName = repo
+	}
 	branch := getStringInput(inputs, "branch")
 	if branch == "" {
 		return nil, requiredInputError("create_fork_pr", "branch", inputs, "branch name for the PR")
@@ -730,44 +739,56 @@ func (p *Provider) executeCreateForkPR(ctx context.Context, client *httpc.Client
 	}
 
 	// --- Step 2: Fork the repository ---
-	lgr.V(1).Info("create_fork_pr: forking repository", "owner", owner, "repo", repo, "fork_org", forkOrg)
+	lgr.V(1).Info("create_fork_pr: forking repository", "owner", owner, "repo", repo, "fork_org", forkOrg, "fork_repo_name", forkRepoName)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	forkResult, err := p.forkOrGetExisting(ctx, client, apiBase, owner, repo, forkOrg, base == upstreamDefaultBranch)
+	forkResult, err := p.forkOrGetExisting(ctx, client, apiBase, owner, repo, forkOrg, forkRepoName, base == upstreamDefaultBranch)
 	if err != nil {
 		return nil, fmt.Errorf("create_fork_pr: fork failed: %w", err)
 	}
 	forkNodeID, _ := forkResult["node_id"].(string)
 	if forkNodeID == "" {
-		return nil, fmt.Errorf("create_fork_pr: fork response missing node_id for %s/%s", forkOrg, repo)
+		return nil, fmt.Errorf("create_fork_pr: fork response missing node_id for %s/%s", forkOrg, forkRepoName)
+	}
+
+	// GitHub's fork endpoint only applies "name" when it actually creates the
+	// fork. If a fork of this upstream already exists in forkOrg under another
+	// name, the API returns that existing repository unrenamed -- so trust the
+	// name GitHub reports rather than the requested one, otherwise every
+	// subsequent fork-side call would target a repository that does not exist
+	// and fail as an opaque "fork not ready" timeout.
+	if actualName, ok := forkResult["name"].(string); ok && actualName != "" && actualName != forkRepoName {
+		lgr.V(1).Info("create_fork_pr: fork exists under a different name; using the existing name",
+			"requested", forkRepoName, "actual", actualName)
+		forkRepoName = actualName
 	}
 
 	// --- Step 3: Wait for fork readiness ---
-	lgr.V(1).Info("create_fork_pr: waiting for fork readiness", "fork_org", forkOrg, "repo", repo)
+	lgr.V(1).Info("create_fork_pr: waiting for fork readiness", "fork_org", forkOrg, "repo", forkRepoName)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	headOID, err := p.waitForForkReady(ctx, client, apiBase, forkOrg, repo, base)
+	headOID, err := p.waitForForkReady(ctx, client, apiBase, forkOrg, forkRepoName, base)
 	if err != nil {
 		return nil, fmt.Errorf("create_fork_pr: fork not ready: %w", err)
 	}
 
 	// --- Step 4: Sync fork with upstream (if enabled) ---
 	if syncFork {
-		lgr.V(1).Info("create_fork_pr: syncing fork with upstream", "fork_org", forkOrg, "repo", repo)
+		lgr.V(1).Info("create_fork_pr: syncing fork with upstream", "fork_org", forkOrg, "repo", forkRepoName)
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		if syncErr := p.syncForkWithUpstream(ctx, client, apiBase, forkOrg, repo, base); syncErr != nil {
+		if syncErr := p.syncForkWithUpstream(ctx, client, apiBase, forkOrg, forkRepoName, base); syncErr != nil {
 			// Non-fatal: log and continue (fork may already be up to date or merge-upstream unsupported)
 			lgr.V(1).Info("create_fork_pr: sync fork warning (continuing)", "error", syncErr)
 		} else {
 			// Re-fetch HEAD OID after sync.
-			newOID, err := p.getHeadOID(ctx, client, apiBase, forkOrg, repo, base)
+			newOID, err := p.getHeadOID(ctx, client, apiBase, forkOrg, forkRepoName, base)
 			if err == nil {
 				headOID = newOID
 			}
@@ -775,25 +796,25 @@ func (p *Provider) executeCreateForkPR(ctx context.Context, client *httpc.Client
 	}
 
 	// --- Step 5: Create or force-reset branch on fork ---
-	lgr.V(1).Info("create_fork_pr: creating branch on fork", "fork_org", forkOrg, "repo", repo, "branch", branch, "force", force)
+	lgr.V(1).Info("create_fork_pr: creating branch on fork", "fork_org", forkOrg, "repo", forkRepoName, "branch", branch, "force", force)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	branchOID, err := p.createOrResetBranch(ctx, client, apiBase, forkOrg, repo, branch, headOID, force)
+	branchOID, err := p.createOrResetBranch(ctx, client, apiBase, forkOrg, forkRepoName, branch, headOID, force)
 	if err != nil {
 		return nil, fmt.Errorf("create_fork_pr: branch creation failed: %w", err)
 	}
 
 	// --- Step 6: Commit files ---
-	lgr.V(1).Info("create_fork_pr: committing files", "fork_org", forkOrg, "repo", repo, "branch", branch)
+	lgr.V(1).Info("create_fork_pr: committing files", "fork_org", forkOrg, "repo", forkRepoName, "branch", branch)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
-	commitOutput, err := p.commitWithRetry(ctx, client, apiBase, forkOrg, repo, branch, message, branchOID, additions, deletions, inputs)
+	commitOutput, err := p.commitWithRetry(ctx, client, apiBase, forkOrg, forkRepoName, branch, message, branchOID, additions, deletions, inputs)
 	if err != nil {
-		return nil, fmt.Errorf("create_fork_pr: commit failed (fork: %s/%s): %w", forkOrg, repo, err)
+		return nil, fmt.Errorf("create_fork_pr: commit failed (fork: %s/%s): %w", forkOrg, forkRepoName, err)
 	}
 	var commitResult any
 	if dataMap, ok := commitOutput.Data.(map[string]any); ok {
@@ -812,9 +833,10 @@ func (p *Provider) executeCreateForkPR(ctx context.Context, client *httpc.Client
 	}
 
 	return actionOutput("create_fork_pr", map[string]any{
-		"fork":         forkResult,
-		"commit":       commitResult,
-		"pull_request": prOutput,
+		"fork":           forkResult,
+		"fork_repo_name": forkRepoName,
+		"commit":         commitResult,
+		"pull_request":   prOutput,
 	}), nil
 }
 
@@ -848,10 +870,18 @@ func (p *Provider) getRepoInfo(ctx context.Context, client *httpc.Client, apiBas
 }
 
 // forkOrGetExisting forks a repo or returns existing fork details on 422.
-func (p *Provider) forkOrGetExisting(ctx context.Context, client *httpc.Client, apiBase, owner, repo, forkOrg string, defaultBranchOnly bool) (map[string]any, error) {
+// forkRepoName is the name the fork should have and must be non-empty (callers
+// default it to repo). When it differs from repo it is sent as the REST API's
+// optional "name" field to name the new fork, and is used for the fork-side
+// lookup in the "already exists" fallback.
+func (p *Provider) forkOrGetExisting(ctx context.Context, client *httpc.Client, apiBase, owner, repo, forkOrg, forkRepoName string, defaultBranchOnly bool) (map[string]any, error) {
 	reqBody := map[string]any{
 		"organization":        forkOrg,
 		"default_branch_only": defaultBranchOnly,
+	}
+	renamed := forkRepoName != repo
+	if renamed {
+		reqBody["name"] = forkRepoName
 	}
 
 	restURL := fmt.Sprintf("%s/repos/%s/%s/forks", apiBase, owner, repo)
@@ -859,25 +889,31 @@ func (p *Provider) forkOrGetExisting(ctx context.Context, client *httpc.Client, 
 	if err != nil {
 		var re *restError
 		if errors.As(err, &re) && re.StatusCode == http.StatusUnprocessableEntity {
-			// Fork already exists -- fetch it.
-			getURL := fmt.Sprintf("%s/repos/%s/%s", apiBase, forkOrg, repo)
+			// Fork already exists -- fetch it by the fork's own name.
+			getURL := fmt.Sprintf("%s/repos/%s/%s", apiBase, forkOrg, url.PathEscape(forkRepoName))
 			existing, getErr := p.doRESTRequest(ctx, client, http.MethodGet, getURL, nil)
 			if getErr != nil {
 				return nil, fmt.Errorf("fork already exists but failed to fetch: %w", getErr)
 			}
 			m, ok := existing.(map[string]any)
 			if !ok {
-				return nil, fmt.Errorf("fork already exists but response for %s/%s is not a JSON object", forkOrg, repo)
+				return nil, fmt.Errorf("fork already exists but response for %s/%s is not a JSON object", forkOrg, forkRepoName)
 			}
 			// Validate that the existing repo is actually a fork of the upstream.
+			expected := owner + "/" + repo
 			if parent, hasParent := m["parent"].(map[string]any); hasParent {
 				parentFullName, _ := parent["full_name"].(string)
-				expected := owner + "/" + repo
 				if parentFullName != expected {
-					return nil, fmt.Errorf("repo %s/%s exists but is not a fork of %s (parent: %s)", forkOrg, repo, expected, parentFullName)
+					return nil, fmt.Errorf("repo %s/%s exists but is not a fork of %s (parent: %s)", forkOrg, forkRepoName, expected, parentFullName)
 				}
+			} else if renamed {
+				// With a caller-supplied fork name the target repo is not
+				// guaranteed to be related to the upstream at all, so an
+				// unverifiable parent must not be treated as good enough --
+				// committing into the wrong repository is unrecoverable.
+				return nil, fmt.Errorf("repo %s/%s exists but its parent could not be verified against %s; refusing to commit to an unverified repository", forkOrg, forkRepoName, expected)
 			} else if isFork, _ := m["fork"].(bool); !isFork {
-				return nil, fmt.Errorf("repo %s/%s exists but is not a fork", forkOrg, repo)
+				return nil, fmt.Errorf("repo %s/%s exists but is not a fork", forkOrg, forkRepoName)
 			}
 			return m, nil
 		}
@@ -1105,7 +1141,7 @@ func isFullCommitSHA(ref string) bool {
 
 // syncForkWithUpstream syncs the fork's branch with the upstream using the merge-upstream API.
 func (p *Provider) syncForkWithUpstream(ctx context.Context, client *httpc.Client, apiBase, forkOrg, repo, branch string) error {
-	restURL := fmt.Sprintf("%s/repos/%s/%s/merge-upstream", apiBase, forkOrg, repo)
+	restURL := fmt.Sprintf("%s/repos/%s/%s/merge-upstream", apiBase, forkOrg, url.PathEscape(repo))
 	reqBody := map[string]any{"branch": branch}
 	_, err := p.doRESTRequest(ctx, client, http.MethodPost, restURL, reqBody)
 	return err

@@ -380,6 +380,17 @@ func (*Plugin) DescribeWhatIf(_ context.Context, providerName string, inputs map
 	owner, _ := inputs["owner"].(string)
 	repo, _ := inputs["repo"].(string)
 	target := owner + "/" + repo
+	// create_fork_pr writes to a fork rather than the named repo, so the
+	// destination is the most useful part of a what-if for it.
+	if operation == "create_fork_pr" {
+		if forkOrg, _ := inputs["fork_org"].(string); forkOrg != "" {
+			forkRepoName, _ := inputs["fork_repo_name"].(string)
+			if forkRepoName == "" {
+				forkRepoName = repo
+			}
+			return fmt.Sprintf("Would perform GitHub %s on %s via fork %s/%s", operation, target, forkOrg, forkRepoName), nil
+		}
+	}
 	return fmt.Sprintf("Would perform GitHub %s on %s", operation, target), nil
 }
 
@@ -1202,7 +1213,12 @@ func buildInputSchema() *jsonschema.Schema {
 			"include_all_branches": sdkhelper.BoolProp("Include all branches when creating from template"),
 
 			// --- create_fork_pr compound operation fields ---
-			"fork_org":  sdkhelper.StringProp("Organization to fork into (for create_fork_pr)", sdkhelper.WithMaxLength(200)),
+			"fork_org": sdkhelper.StringProp("Organization to fork into (for create_fork_pr)", sdkhelper.WithMaxLength(200)),
+			"fork_repo_name": sdkhelper.StringProp("Name for the forked repository (create_fork_pr). Defaults to the upstream repo name. If a fork of the upstream already exists in fork_org under a different name, that existing name is used instead.",
+				sdkhelper.WithPattern(`^[A-Za-z0-9._-]+$`),
+				sdkhelper.WithMaxLength(100),
+				sdkhelper.WithExample("upstream-repo-my-app"),
+			),
 			"force":     sdkhelper.BoolProp("Delete and recreate the branch if it already exists (create_fork_pr)"),
 			"sync_fork": sdkhelper.BoolProp("Sync the fork's base branch with upstream before branching (create_fork_pr, default true)"),
 
@@ -1284,6 +1300,20 @@ state: open`,
 			YAML: `operation: api_call
 endpoint: /repos/my-org/my-repo/labels
 method: GET`,
+		},
+		{
+			Name:        "Fork, commit, and open a PR",
+			Description: "Compound workflow: fork upstream (optionally under a different name), branch, commit, and open a cross-repo PR",
+			YAML: `operation: create_fork_pr
+owner: upstream-org
+repo: upstream-repo
+fork_org: my-fork-org
+fork_repo_name: upstream-repo-my-app
+branch: feat/add-config
+message: "feat: add config"
+additions:
+  - path: config.yaml
+    content: "key: value\n"`,
 		},
 		{
 			Name:        "Load state from GitHub",
