@@ -9,6 +9,7 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) plugin that provides the
 | **from** | Read data from GitHub (repos, files, issues, PRs, releases, branches, tags) |
 | **transform** | Transform data using GitHub API responses |
 | **action** | Write operations (create issues, PRs, commits, releases, repos, labels, etc.) |
+| **state** | Keep a solution's state document as a JSON file in a repository (`state_load`, `state_save`, `state_delete`) |
 
 ## Supported Operations
 
@@ -102,6 +103,45 @@ actions:
         name: help-wanted
         color: "00ff00"
 ```
+
+## State
+
+The **state** capability stores a solution's state document as a JSON file in a repository. `state_load` reads the file at `path` on `ref`, `state_save` writes it with a GitHub-signed commit to `branch`, and `state_delete` removes it. On the first save the branch is created from `base_ref` (a branch, tag, or commit SHA; default: the repository's default branch).
+
+### Open a pull request from `state_save`
+
+Add an optional `pull_request` block and `state_save` also opens a pull request for the state branch once the commit lands:
+
+```yaml
+state:
+  save:
+    - provider: github
+      inputs:
+        owner: my-org
+        repo: my-state-repo
+        path: intent/state.json
+        branch: intent/my-app
+        base_ref: main
+        message: "intent: my-app"
+        pull_request:
+          title: "intent: my-app"
+          body: "Automated state update"
+          base: main
+          draft: false
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `title` | yes | Pull request title. |
+| `body` | no | Pull request body. |
+| `base` | no | Branch the pull request targets. Defaults to `base_ref`, else the repository's default branch. Must differ from `branch`. |
+| `draft` | no | Open the pull request as a draft. Defaults to `false`. |
+
+- An already-open pull request from `branch` to `base` is reused, not duplicated, so repeated saves keep feeding one pull request. A pull request from a fork that happens to use the same branch name is not mistaken for it.
+- The output gains `pull_request: {number, url, created}`; `created` is `false` when an open pull request was reused.
+- The block is validated before anything is committed. If the commit succeeds but the pull request cannot be opened, `state_save` fails with an error that names the commit OID and the branch. A re-run repeats the commit and then retries the pull request.
+- `base_ref` may be a tag or commit SHA when it only seeds the branch, but a pull request needs a branch. A SHA `base_ref` is rejected up front unless `pull_request.base` is set; with a tag `base_ref`, always set `pull_request.base`, otherwise the pull request fails after the commit.
+- Not supported when `state_save` has to initialize an empty repository (one with no commits). It fails before writing anything; add an initial commit first.
 
 ## Authentication
 
