@@ -27,6 +27,24 @@ func (p *Provider) executeCreatePullRequest(ctx context.Context, client *httpc.C
 		return nil, requiredInputError("create_pull_request", "base", inputs, "")
 	}
 
+	var draft *bool
+	if d, ok := getBoolInput(inputs, "draft"); ok {
+		draft = &d
+	}
+
+	pr, err := p.createPullRequest(ctx, client, apiBase, owner, repo, title, head, base, getStringInput(inputs, "body"), draft)
+	if err != nil {
+		return nil, err
+	}
+
+	return actionOutput("create_pull_request", pr), nil
+}
+
+// createPullRequest opens a pull request from head to base through the GraphQL
+// createPullRequest mutation and returns the created pull request node. body is
+// sent only when non-empty and draft only when non-nil (GitHub then defaults to
+// a regular, non-draft pull request).
+func (p *Provider) createPullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo, title, head, base, body string, draft *bool) (map[string]any, error) {
 	repoID, err := p.resolveRepoID(ctx, client, apiBase, owner, repo)
 	if err != nil {
 		return nil, fmt.Errorf("resolving repository ID: %w", err)
@@ -38,11 +56,11 @@ func (p *Provider) executeCreatePullRequest(ctx context.Context, client *httpc.C
 		"headRefName":  head,
 		"baseRefName":  base,
 	}
-	if body := getStringInput(inputs, "body"); body != "" {
+	if body != "" {
 		mutInput["body"] = body
 	}
-	if draft, ok := getBoolInput(inputs, "draft"); ok {
-		mutInput["draft"] = draft
+	if draft != nil {
+		mutInput["draft"] = *draft
 	}
 
 	mutation := `mutation($input: CreatePullRequestInput!) {
@@ -67,12 +85,43 @@ func (p *Provider) executeCreatePullRequest(ctx context.Context, client *httpc.C
 		return nil, err
 	}
 
-	pr, err := extractNodeMap(data, "createPullRequest.pullRequest")
+	return extractNodeMap(data, "createPullRequest.pullRequest")
+}
+
+// findOpenPullRequest returns the open pull request (number and url) from this
+// repository's head branch to base, or nil when there is none. The headRefName
+// filter matches on the branch name alone, so pull requests from forks whose
+// branch happens to share that name come back too; they are skipped, otherwise
+// a stranger's pull request could be mistaken for ours.
+func (p *Provider) findOpenPullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo, head, base string) (map[string]any, error) {
+	query := `query($owner: String!, $name: String!, $head: String!, $base: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequests(headRefName: $head, baseRefName: $base, states: [OPEN], first: 20) {
+      nodes { number url isCrossRepository }
+    }
+  }
+}`
+	vars := map[string]any{"owner": owner, "name": repo, "head": head, "base": base}
+	data, err := graphqlDo(ctx, client, apiBase, query, vars)
 	if err != nil {
 		return nil, err
 	}
 
-	return actionOutput("create_pull_request", pr), nil
+	nodes, err := extractNodes(data, "repository.pullRequests")
+	if err != nil {
+		return nil, err
+	}
+	for _, node := range nodes {
+		pr, ok := node.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("unexpected pull request node format")
+		}
+		if cross, _ := pr["isCrossRepository"].(bool); cross {
+			continue
+		}
+		return pr, nil
+	}
+	return nil, nil
 }
 
 // ─── Update Pull Request ─────────────────────────────────────────────────────

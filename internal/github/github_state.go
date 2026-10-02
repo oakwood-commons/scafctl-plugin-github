@@ -60,6 +60,10 @@ func (p *Provider) executeStateLoad(ctx context.Context, client *httpc.Client, a
 // repository's default branch) before committing. If the repository has no
 // commits at all (a brand-new empty repo) the initial commit is seeded through
 // the REST Contents API, which is the only way to create the first commit.
+//
+// When the optional "pull_request" input is set, a pull request for the state
+// branch is opened after the commit (or reused if one is already open). The
+// block is validated up front, before anything is committed.
 func (p *Provider) executeStateSave(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
 	path := getStringInput(inputs, "path")
 	if path == "" {
@@ -86,23 +90,114 @@ func (p *Provider) executeStateSave(ctx context.Context, client *httpc.Client, a
 		return nil, fmt.Errorf("state_save: marshal state: %w", err)
 	}
 
+	// Validate the pull_request block before any commit so bad input has no
+	// side effects.
+	pr, err := p.resolveStatePullRequest(ctx, client, apiBase, owner, repo, branch, baseRef, inputs)
+	if err != nil {
+		return nil, err
+	}
+
 	// Fetch current HEAD OID for optimistic locking.
 	headOID, err := p.getHeadOID(ctx, client, apiBase, owner, repo, branch)
 	if err != nil {
 		if isBranchNotFound(err) {
 			// First save -- the target branch does not exist yet. Bootstrap it
 			// rather than failing with "branch not found".
-			return p.bootstrapStateSave(ctx, client, apiBase, owner, repo, path, branch, baseRef, message, stateJSON)
+			return p.bootstrapStateSave(ctx, client, apiBase, owner, repo, path, branch, baseRef, message, stateJSON, pr)
 		}
 		return nil, fmt.Errorf("state_save: get branch HEAD: %w", err)
 	}
 
-	return p.commitStateFile(ctx, client, apiBase, owner, repo, path, branch, message, headOID, stateJSON)
+	return p.commitStateFile(ctx, client, apiBase, owner, repo, path, branch, message, headOID, stateJSON, pr)
+}
+
+// statePullRequest is the validated "pull_request" input of state_save.
+type statePullRequest struct {
+	title string
+	body  string
+	base  string
+	draft *bool // nil when not set, so GitHub applies its default (not a draft)
+}
+
+// resolveStatePullRequest parses and validates the optional "pull_request"
+// input of state_save. It returns nil when the block is absent. The base branch
+// defaults to base_ref, then to the repository's default branch (one API call,
+// made only when neither is set).
+func (p *Provider) resolveStatePullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo, branch, baseRef string, inputs map[string]any) (*statePullRequest, error) {
+	raw, ok := inputs["pull_request"]
+	if !ok || raw == nil {
+		return nil, nil
+	}
+	prInput, ok := raw.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("state_save: 'pull_request' must be an object, got %T", raw)
+	}
+
+	title := getStringInput(prInput, "title")
+	if strings.TrimSpace(title) == "" {
+		return nil, requiredInputError("state_save", "pull_request.title", inputs, "")
+	}
+
+	base := getStringInput(prInput, "base")
+	if base == "" {
+		// base_ref may be a tag or commit SHA because it only seeds the branch,
+		// but a pull request needs a branch. A SHA is recognizable up front; a
+		// tag is not without an API call, so that case is left to the README.
+		if isFullCommitSHA(baseRef) {
+			return nil, fmt.Errorf("state_save: base_ref %q is a commit SHA, which cannot be the pull request base -- set pull_request.base to a branch", baseRef)
+		}
+		base = baseRef
+	}
+	if base == "" {
+		name, err := p.getRepoDefaultBranchName(ctx, client, apiBase, owner, repo)
+		if err != nil {
+			return nil, fmt.Errorf("state_save: resolve default branch for pull request base: %w", err)
+		}
+		base = name
+	}
+	if base == branch {
+		return nil, fmt.Errorf("state_save: pull_request.base must differ from branch (both are %q)", branch)
+	}
+
+	pr := &statePullRequest{title: title, body: getStringInput(prInput, "body"), base: base}
+	if draft, ok := getBoolInput(prInput, "draft"); ok {
+		pr.draft = &draft
+	}
+	return pr, nil
+}
+
+// ensureStatePullRequest returns the open pull request from branch to pr.base,
+// opening one when none exists. The result is the state_save "pull_request"
+// output: {number, url, created}.
+func (p *Provider) ensureStatePullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo, branch string, pr *statePullRequest) (map[string]any, error) {
+	existing, err := p.findOpenPullRequest(ctx, client, apiBase, owner, repo, branch, pr.base)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		return statePullRequestOutput(existing, false), nil
+	}
+
+	created, err := p.createPullRequest(ctx, client, apiBase, owner, repo, pr.title, branch, pr.base, pr.body, pr.draft)
+	if err != nil {
+		return nil, err
+	}
+	return statePullRequestOutput(created, true), nil
+}
+
+// statePullRequestOutput builds the state_save "pull_request" output from a
+// GraphQL pull request node. The node's number arrives as a float64 (JSON); it
+// is normalized to an int.
+func statePullRequestOutput(node map[string]any, created bool) map[string]any {
+	number, _ := getIntInput(node, "number")
+	prURL, _ := node["url"].(string)
+	return map[string]any{"number": number, "url": prURL, "created": created}
 }
 
 // commitStateFile creates a signed commit that writes the state file to an
-// existing branch, using expectedOID for optimistic locking.
-func (p *Provider) commitStateFile(ctx context.Context, client *httpc.Client, apiBase, owner, repo, path, branch, message, expectedOID string, stateJSON []byte) (*sdkprovider.Output, error) {
+// existing branch, using expectedOID for optimistic locking. When pr is set it
+// then opens (or reuses) the pull request for the branch.
+func (p *Provider) commitStateFile(ctx context.Context, client *httpc.Client, apiBase, owner, repo, path, branch, message, expectedOID string, stateJSON []byte, pr *statePullRequest) (*sdkprovider.Output, error) {
 	// Create commit with the state file (with FORBIDDEN retry for permission propagation).
 	commitOutput, err := p.commitWithRetry(
 		ctx, client, apiBase, owner, repo, branch, message, expectedOID,
@@ -117,14 +212,26 @@ func (p *Provider) commitStateFile(ctx context.Context, client *httpc.Client, ap
 		return nil, fmt.Errorf("state_save: create commit: %w", err)
 	}
 
-	return stateSaveOutput(commitOIDFromCommitOutput(commitOutput)), nil
+	commitOID := commitOIDFromCommitOutput(commitOutput)
+	if pr == nil {
+		return stateSaveOutput(commitOID, nil), nil
+	}
+
+	prOutput, err := p.ensureStatePullRequest(ctx, client, apiBase, owner, repo, branch, pr)
+	if err != nil {
+		// The commit is already on the branch; say so, so the caller knows a
+		// re-run only needs to retry the pull request.
+		return nil, fmt.Errorf("state_save: committed %s to branch %q but failed to open pull request: %w", commitOID, branch, err)
+	}
+	return stateSaveOutput(commitOID, prOutput), nil
 }
 
 // bootstrapStateSave handles the first save against a branch that does not yet
 // exist. It creates the branch from a base ref (or the repository default
 // branch) and then commits the state file. When the repository has no commits
-// at all, it seeds the initial commit through the REST Contents API.
-func (p *Provider) bootstrapStateSave(ctx context.Context, client *httpc.Client, apiBase, owner, repo, path, branch, baseRef, message string, stateJSON []byte) (*sdkprovider.Output, error) {
+// at all, it seeds the initial commit through the REST Contents API, which
+// cannot be combined with a pull request (there is no base branch to target).
+func (p *Provider) bootstrapStateSave(ctx context.Context, client *httpc.Client, apiBase, owner, repo, path, branch, baseRef, message string, stateJSON []byte, pr *statePullRequest) (*sdkprovider.Output, error) {
 	// Resolve the OID the new branch should point at.
 	var baseOID string
 	if baseRef != "" {
@@ -144,6 +251,9 @@ func (p *Provider) bootstrapStateSave(ctx context.Context, client *httpc.Client,
 		if oid == "" {
 			// The repository has no commits yet -- there is no base to branch
 			// from. Seed the first commit through the REST Contents API.
+			if pr != nil {
+				return nil, fmt.Errorf("state_save: pull_request is not supported when initializing an empty repository (%s/%s has no commits yet) -- add an initial commit first, or remove pull_request", owner, repo)
+			}
 			return p.seedStateOnEmptyRepo(ctx, client, apiBase, owner, repo, path, branch, message, stateJSON)
 		}
 		baseOID = oid
@@ -156,7 +266,7 @@ func (p *Provider) bootstrapStateSave(ctx context.Context, client *httpc.Client,
 		return nil, fmt.Errorf("state_save: create state branch %q: %w", branch, err)
 	}
 
-	return p.commitStateFile(ctx, client, apiBase, owner, repo, path, branch, message, branchOID, stateJSON)
+	return p.commitStateFile(ctx, client, apiBase, owner, repo, path, branch, message, branchOID, stateJSON, pr)
 }
 
 // seedStateOnEmptyRepo creates the very first commit in an empty repository (one
@@ -191,7 +301,7 @@ func (p *Provider) seedStateOnEmptyRepo(ctx context.Context, client *httpc.Clien
 			owner, repo, branch, err, defaultBranch)
 	}
 
-	return stateSaveOutput(commitSHAFromContentsResponse(resp)), nil
+	return stateSaveOutput(commitSHAFromContentsResponse(resp), nil), nil
 }
 
 // ─── State Delete ────────────────────────────────────────────────────────────
@@ -386,11 +496,15 @@ func stateOutput(success bool, data any) *sdkprovider.Output {
 }
 
 // stateSaveOutput builds the output for a successful state_save, including the
-// commit OID when one is known.
-func stateSaveOutput(commitOID string) *sdkprovider.Output {
+// commit OID when one is known and the pull request when one was opened or
+// reused.
+func stateSaveOutput(commitOID string, pr map[string]any) *sdkprovider.Output {
 	result := map[string]any{"success": true}
 	if commitOID != "" {
 		result["commit_oid"] = commitOID
+	}
+	if pr != nil {
+		result["pull_request"] = pr
 	}
 	return &sdkprovider.Output{Data: result}
 }

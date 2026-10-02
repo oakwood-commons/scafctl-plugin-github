@@ -256,6 +256,11 @@ func newProvider(opts ...Option) *Provider {
 					"success":    sdkhelper.BoolProp("Whether the state operation succeeded"),
 					"data":       sdkhelper.AnyProp("The state data (for state_load)"),
 					"commit_oid": sdkhelper.StringProp("The OID of the commit created by state_save or state_delete"),
+					"pull_request": sdkhelper.ObjectProp("Pull request opened or reused by state_save", nil, map[string]*jsonschema.Schema{
+						"number":  sdkhelper.IntProp("Pull request number"),
+						"url":     sdkhelper.StringProp("Pull request URL"),
+						"created": sdkhelper.BoolProp("True when state_save opened a new pull request, false when it reused an already-open one"),
+					}),
 				}),
 			},
 			Examples: buildExamples(),
@@ -1035,7 +1040,7 @@ func buildInputSchema() *jsonschema.Schema {
 			"branch": sdkhelper.StringProp("Branch name for commit, branch, or tag operations",
 				sdkhelper.WithMaxLength(200),
 			),
-			"base_ref": sdkhelper.StringProp("Base ref (branch, tag, or commit SHA) to create the state branch from on first save. Defaults to the repository's default branch.",
+			"base_ref": sdkhelper.StringProp("Base ref (branch, tag, or commit SHA) to create the state branch from on first save. Defaults to the repository's default branch. Also the default base of state_save's pull_request, where it must be a branch.",
 				sdkhelper.WithExample("main"),
 				sdkhelper.WithMaxLength(200),
 			),
@@ -1239,6 +1244,22 @@ func buildInputSchema() *jsonschema.Schema {
 
 			// --- State operation fields ---
 			"data": sdkhelper.AnyProp("State data to persist (for state_save)"),
+			"pull_request": sdkhelper.ObjectProp(
+				"Open (or reuse) a pull request for the state branch after state_save commits. Not supported when state_save has to initialize an empty repository.",
+				[]string{"title"},
+				map[string]*jsonschema.Schema{
+					"title": sdkhelper.StringProp("Pull request title",
+						sdkhelper.WithMaxLength(1000),
+					),
+					"body": sdkhelper.StringProp("Pull request body",
+						sdkhelper.WithMaxLength(65536),
+					),
+					"base": sdkhelper.StringProp("Branch the pull request targets; must differ from branch. Defaults to base_ref, else the repository's default branch.",
+						sdkhelper.WithMaxLength(200),
+					),
+					"draft": sdkhelper.BoolProp("Whether to open the pull request as a draft (default false)"),
+				},
+			),
 		},
 	)
 }
@@ -1335,6 +1356,24 @@ branch: main
 data:
   app_name: my-app
   last_run: "2025-01-01T00:00:00Z"`,
+		},
+		{
+			Name:        "Save state and open a pull request",
+			Description: "Commit state to a branch (created on first save) and open a pull request for it, or reuse the one already open",
+			YAML: `operation: state_save
+owner: my-org
+repo: my-state-repo
+path: intent/my-app.json
+branch: intent/my-app
+base_ref: main
+message: "intent: my-app"
+data:
+  app_name: my-app
+pull_request:
+  title: "intent: my-app"
+  body: "Automated state update"
+  base: main
+  draft: false`,
 		},
 	}
 }
