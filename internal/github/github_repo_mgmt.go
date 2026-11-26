@@ -349,6 +349,9 @@ func (p *Provider) resolveOwnerID(ctx context.Context, client *httpc.Client, api
 // The REST API is used because the GraphQL mutations for rulesets have complex
 // nested union input types that don't map cleanly to a flat input schema.
 
+// maxApprovingReviewCount is GitHub's upper bound for pull_request ruleset approvals.
+const maxApprovingReviewCount = 10
+
 func (p *Provider) executeCreateRuleset(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
 	rulesetName := getStringInput(inputs, "ruleset_name")
 	if rulesetName == "" {
@@ -370,6 +373,13 @@ func (p *Provider) executeCreateRuleset(ctx context.Context, client *httpc.Clien
 	excludeRefs := getStringSliceInput(inputs, "exclude_refs")
 	if len(includeRefs) == 0 {
 		return nil, requiredInputError("create_ruleset", "include_refs", inputs, `e.g. ["refs/heads/main"]`)
+	}
+
+	if rawApprovals, hasApprovals := inputs["required_approving_review_count"]; hasApprovals && rawApprovals != nil {
+		approvals, ok := getIntInput(inputs, "required_approving_review_count")
+		if !ok || approvals < 0 || approvals > maxApprovingReviewCount {
+			return nil, fmt.Errorf("create_ruleset: 'required_approving_review_count' must be an integer between 0 and %d", maxApprovingReviewCount)
+		}
 	}
 
 	// Ensure exclude is never null (API requires an array)

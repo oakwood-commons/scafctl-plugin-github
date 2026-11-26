@@ -13,10 +13,10 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) plugin that provides the
 ## Supported Operations
 
 ### Read Operations
-`get_repo`, `get_file`, `list_releases`, `get_latest_release`, `list_pull_requests`, `get_pull_request`, `list_issues`, `get_issue`, `list_issue_comments`, `list_branches`, `get_branch`, `list_tags`, `get_head_oid`, `list_pr_comments`, `list_review_threads`, `list_check_runs`, `get_workflow_run`, `list_commit_pulls`, `list_labels`, `list_milestones`, `list_reactions`, `list_collaborators`, `list_webhooks`, `list_workflow_runs`, `list_repo_variables`, `list_environments`, `list_topics`, `list_custom_properties`
+`get_repo`, `get_file`, `list_releases`, `get_latest_release`, `list_pull_requests`, `get_pull_request`, `list_issues`, `get_issue`, `list_issue_comments`, `list_branches`, `get_branch`, `list_tags`, `get_head_oid`, `list_pr_comments`, `list_review_threads`, `list_pr_reviews`, `list_check_runs`, `get_workflow_run`, `get_job_logs`, `list_commit_pulls`, `list_labels`, `list_milestones`, `list_reactions`, `list_collaborators`, `list_webhooks`, `list_workflow_runs`, `list_repo_variables`, `list_environments`, `list_topics`, `list_custom_properties`
 
 ### Write Operations
-`create_issue`, `update_issue`, `create_issue_comment`, `create_pull_request`, `update_pull_request`, `merge_pull_request`, `close_pull_request`, `create_commit`, `create_branch`, `delete_branch`, `create_tag`, `delete_tag`, `create_release`, `update_release`, `delete_release`, `create_repo`, `update_repo`, `create_ruleset`, `enable_vulnerability_alerts`, `enable_automated_security_fixes`, `create_label`, `update_label`, `delete_label`, `add_labels_to_issue`, `remove_label_from_issue`, `create_milestone`, `update_milestone`, `delete_milestone`, `add_reaction`, `delete_reaction`, `add_collaborator`, `remove_collaborator`, `create_webhook`, `update_webhook`, `delete_webhook`, `dispatch_workflow`, `cancel_workflow_run`, `rerun_workflow`, `create_or_update_variable`, `delete_variable`, `create_or_update_environment`, `delete_environment`, `replace_topics`, `fork_repo`, `create_from_template`, `set_custom_properties`, `reply_to_review_thread`, `resolve_review_thread`
+`create_issue`, `update_issue`, `create_issue_comment`, `create_pull_request`, `update_pull_request`, `merge_pull_request`, `close_pull_request`, `request_reviewers`, `create_commit`, `create_branch`, `delete_branch`, `create_tag`, `delete_tag`, `create_release`, `update_release`, `delete_release`, `create_repo`, `update_repo`, `create_ruleset`, `enable_vulnerability_alerts`, `enable_automated_security_fixes`, `create_label`, `update_label`, `delete_label`, `add_labels_to_issue`, `remove_label_from_issue`, `create_milestone`, `update_milestone`, `delete_milestone`, `add_reaction`, `delete_reaction`, `add_collaborator`, `remove_collaborator`, `create_webhook`, `update_webhook`, `delete_webhook`, `dispatch_workflow`, `cancel_workflow_run`, `rerun_workflow`, `create_or_update_variable`, `delete_variable`, `create_or_update_environment`, `delete_environment`, `replace_topics`, `fork_repo`, `create_from_template`, `set_custom_properties`, `reply_to_review_thread`, `resolve_review_thread`
 
 ### Compound Operations
 `create_fork_pr` -- fork a repository, sync it with upstream, create a branch, commit files, and open a cross-repo pull request in a single action
@@ -91,6 +91,69 @@ actions:
 ```
 
 ```yaml
+# Snapshot pull request reviews and unresolved review threads
+resolvers:
+  pr-reviews:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: list_pr_reviews
+            owner: my-org
+            repo: my-repo
+            number: 42
+  open-threads:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: list_review_threads
+            owner: my-org
+            repo: my-repo
+            number: 42
+            unresolved_only: true
+```
+
+```yaml
+# Fetch trailing logs from a failed GitHub Actions job
+resolvers:
+  failed-job-logs:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: get_job_logs
+            owner: my-org
+            repo: my-repo
+            job_id: 123456789
+            tail_lines: 200
+```
+
+```yaml
+# Mark a pull request ready for review and request human, team, and bot reviewers
+actions:
+  - provider: github
+    inputs:
+      operation: update_pull_request
+      owner: my-org
+      repo: my-repo
+      number: 42
+      draft: false
+  - provider: github
+    inputs:
+      operation: request_reviewers
+      owner: my-org
+      repo: my-repo
+      number: 42
+      reviewers:
+        - octocat
+      team_reviewers:
+        - platform-reviewers
+      bot_ids:
+        - BOT_kgDOCnlnWA
+```
+
+```yaml
 # Generic REST API call
 actions:
   - provider: github
@@ -105,7 +168,14 @@ actions:
 
 ## Authentication
 
-Authentication is handled automatically via the configured `github` auth handler in scafctl. No manual token configuration is needed.
+Authentication is handled automatically via the configured `github` auth handler in scafctl. No manual token configuration is needed for single-account runs.
+
+For multi-account or multi-organization workflows, individual steps can override credentials using either `auth_profile` or `token` (mutually exclusive):
+
+- `auth_profile`: selects a named profile from the host `github` auth handler for that step (for example `auth_profile: secondary`).
+- `token`: supplies an explicit bearer token for that step (compatible with scafctl `tkn:` and `scrt:` credential references; marked sensitive/write-only and never refreshed via the ambient host session on HTTP 401).
+
+Both fields fail closed when set to an empty or whitespace-only string so a misconfigured step never falls back to ambient credentials. Cross-origin HTTP redirects (such as GitHub Actions log downloads redirecting to object storage) automatically strip `Authorization` and `X-GitHub-Api-Version` headers.
 
 For GitHub Enterprise, set the `api_base` input to your instance URL.
 
