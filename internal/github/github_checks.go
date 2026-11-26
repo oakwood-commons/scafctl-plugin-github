@@ -4,12 +4,26 @@
 package github
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
+	"unicode/utf8"
 
 	"github.com/oakwood-commons/httpc"
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
+)
+
+const (
+	defaultJobLogsTailLines = 200
+	maxJobLogsTailLines     = 10000
+	defaultJobLogsMaxBytes  = 262144           // 256 KiB
+	maxJobLogsMaxBytes      = 10485760         // 10 MiB
+	maxJobLogsStreamBytes   = 64 * 1024 * 1024 // 64 MiB
 )
 
 // ─── List Check Runs ─────────────────────────────────────────────────────────
@@ -196,4 +210,194 @@ func (p *Provider) executeListCommitPulls(ctx context.Context, client *httpc.Cli
 		"total_count":   len(prs),
 		"pull_requests": prs,
 	}), nil
+}
+
+// ─── Get Job Logs ────────────────────────────────────────────────────────────
+
+// executeGetJobLogs downloads plain-text logs for a GitHub Actions job via the REST API
+// and retains only the bounded tail in memory.
+func (p *Provider) executeGetJobLogs(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
+	if client == nil {
+		return nil, fmt.Errorf("HTTP client is not initialized")
+	}
+	jobID, err := requirePositiveIntInput(inputs, "get_job_logs", "job_id")
+	if err != nil {
+		return nil, err
+	}
+
+	tailLines := defaultJobLogsTailLines
+	if rawTail, exists := inputs["tail_lines"]; exists && rawTail != nil {
+		tl, valid := getIntInput(inputs, "tail_lines")
+		if !valid {
+			return nil, fmt.Errorf("get_job_logs: 'tail_lines' must be an integer")
+		}
+		if tl < 0 || tl > maxJobLogsTailLines {
+			return nil, fmt.Errorf("get_job_logs: 'tail_lines' must be between 0 and %d, got %d", maxJobLogsTailLines, tl)
+		}
+		tailLines = tl
+	}
+
+	maxBytes := defaultJobLogsMaxBytes
+	if rawMax, exists := inputs["max_bytes"]; exists && rawMax != nil {
+		mb, valid := getIntInput(inputs, "max_bytes")
+		if !valid {
+			return nil, fmt.Errorf("get_job_logs: 'max_bytes' must be an integer")
+		}
+		if mb < 1 || mb > maxJobLogsMaxBytes {
+			return nil, fmt.Errorf("get_job_logs: 'max_bytes' must be between 1 and %d, got %d", maxJobLogsMaxBytes, mb)
+		}
+		maxBytes = mb
+	}
+
+	logsURL := fmt.Sprintf("%s/repos/%s/%s/actions/jobs/%d/logs", apiBase, url.PathEscape(owner), url.PathEscape(repo), jobID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logsURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating job logs request: %w", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := client.Do(req)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close() //nolint:errcheck // best-effort close
+	}
+	if err != nil {
+		return nil, fmt.Errorf("fetching job logs: %w", redactURLErrorQuery(err))
+	}
+
+	if resp.StatusCode >= 400 {
+		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+		msg := string(errBody)
+		var ghErr map[string]any
+		if json.Unmarshal(errBody, &ghErr) == nil {
+			if m, isStr := ghErr["message"].(string); isStr {
+				msg = m
+			}
+		}
+		return nil, fmt.Errorf("fetching job logs: %w", &restError{StatusCode: resp.StatusCode, Message: msg})
+	}
+
+	logsText, truncated, totalBytes, returnedLines, err := readLogTail(resp.Body, maxBytes, tailLines)
+	if err != nil {
+		return nil, fmt.Errorf("reading job logs: %w", err)
+	}
+
+	return readOutput(map[string]any{
+		"job_id":         jobID,
+		"logs":           logsText,
+		"truncated":      truncated,
+		"total_bytes":    totalBytes,
+		"returned_lines": returnedLines,
+	}), nil
+}
+
+// readLogTail streams r through a fixed-capacity circular byte buffer of size maxBytes
+// up to maxJobLogsStreamBytes and returns at most tailLines trailing lines (or all
+// lines within maxBytes when tailLines == 0).
+func readLogTail(r io.Reader, maxBytes, tailLines int) (logsText string, truncated bool, totalBytes int64, returnedLines int, err error) {
+	return readLogTailWithLimit(r, maxBytes, tailLines, maxJobLogsStreamBytes)
+}
+
+func readLogTailWithLimit(r io.Reader, maxBytes, tailLines int, maxStreamBytes int64) (logsText string, truncated bool, totalBytes int64, returnedLines int, err error) {
+	if maxBytes < 1 {
+		return "", false, 0, 0, fmt.Errorf("maxBytes must be >= 1")
+	}
+
+	ring := make([]byte, maxBytes)
+	var chunk [32 * 1024]byte
+	writePos := 0
+
+	for {
+		n, readErr := r.Read(chunk[:])
+		if n > 0 {
+			totalBytes += int64(n)
+			if maxStreamBytes > 0 && totalBytes > maxStreamBytes {
+				return "", false, totalBytes, 0, fmt.Errorf("job log stream exceeds maximum size of %d bytes", maxStreamBytes)
+			}
+
+			p := chunk[:n]
+			if len(p) >= maxBytes {
+				copy(ring, p[len(p)-maxBytes:])
+				writePos = 0
+			} else {
+				first := min(len(p), maxBytes-writePos)
+				copy(ring[writePos:], p[:first])
+				if rem := len(p) - first; rem > 0 {
+					copy(ring, p[first:])
+					writePos = rem
+				} else {
+					writePos += first
+					if writePos == maxBytes {
+						writePos = 0
+					}
+				}
+			}
+		}
+
+		if readErr != nil {
+			if errors.Is(readErr, io.EOF) {
+				break
+			}
+			return "", false, totalBytes, 0, readErr
+		}
+	}
+
+	if totalBytes == 0 {
+		return "", false, 0, 0, nil
+	}
+
+	byteTruncated := totalBytes > int64(maxBytes)
+	var buf []byte
+	if !byteTruncated {
+		buf = ring[:totalBytes]
+	} else if writePos == 0 {
+		buf = ring
+	} else {
+		buf = make([]byte, maxBytes)
+		n1 := copy(buf, ring[writePos:])
+		copy(buf[n1:], ring[:writePos])
+	}
+
+	if byteTruncated {
+		start := 0
+		for start < len(buf) && !utf8.RuneStart(buf[start]) {
+			start++
+		}
+		buf = buf[start:]
+	}
+
+	if len(buf) == 0 {
+		return "", byteTruncated, totalBytes, 0, nil
+	}
+
+	searchEnd := len(buf)
+	if buf[searchEnd-1] == '\n' {
+		searchEnd--
+	}
+
+	lineTruncated := false
+	if tailLines > 0 {
+		linesFound := 0
+		cutIdx := 0
+		for i := searchEnd - 1; i >= 0; i-- {
+			if buf[i] == '\n' {
+				linesFound++
+				if linesFound == tailLines {
+					cutIdx = i + 1
+					lineTruncated = cutIdx > 0
+					break
+				}
+			}
+		}
+		if cutIdx > 0 {
+			buf = buf[cutIdx:]
+			returnedLines = tailLines
+		} else {
+			returnedLines = linesFound + 1
+		}
+	} else {
+		returnedLines = bytes.Count(buf[:searchEnd], []byte{'\n'}) + 1
+	}
+
+	return string(buf), byteTruncated || lineTruncated, totalBytes, returnedLines, nil
 }

@@ -19,10 +19,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Masterminds/semver/v3"
@@ -76,16 +78,16 @@ var allOperations = []string{
 	"list_issues", "get_issue", "list_issue_comments",
 	"list_branches", "get_branch", "list_tags",
 	"list_pr_comments",
-	// Review thread operations
-	"list_review_threads", "reply_to_review_thread", "resolve_review_thread",
+	// Review thread & PR review operations
+	"list_review_threads", "list_pr_reviews", "reply_to_review_thread", "resolve_review_thread",
 	// CI/CD check operations (REST)
-	"list_check_runs", "get_workflow_run",
+	"list_check_runs", "get_workflow_run", "get_job_logs",
 	// Commit lookup operations (REST)
 	"list_commit_pulls",
 	// Issue write operations
 	"create_issue", "update_issue", "create_issue_comment",
 	// PR write operations
-	"create_pull_request", "update_pull_request", "merge_pull_request", "close_pull_request",
+	"create_pull_request", "update_pull_request", "merge_pull_request", "close_pull_request", "request_reviewers",
 	// Commit & ref operations
 	"create_commit", "get_head_oid",
 	"create_branch", "delete_branch", "create_tag", "delete_tag",
@@ -130,7 +132,8 @@ var readOperations = map[string]bool{
 	"get_head_oid":        true,
 	"list_pr_comments":    true,
 	"list_review_threads": true,
-	"list_check_runs":     true, "get_workflow_run": true,
+	"list_pr_reviews":     true,
+	"list_check_runs":     true, "get_workflow_run": true, "get_job_logs": true,
 	"list_commit_pulls":      true,
 	"list_labels":            true,
 	"list_milestones":        true,
@@ -148,6 +151,8 @@ var readOperations = map[string]bool{
 // Provider implements GitHub API operations as a provider.
 type Provider struct {
 	descriptor *sdkprovider.Descriptor
+
+	clientMu sync.Mutex
 	// client can be overridden for testing via WithClient option.
 	client *httpc.Client
 
@@ -268,7 +273,7 @@ func newProvider(opts ...Option) *Provider {
 				// Issue mutations
 				"create_issue", "update_issue", "create_issue_comment",
 				// PR mutations
-				"create_pull_request", "update_pull_request", "merge_pull_request", "close_pull_request",
+				"create_pull_request", "update_pull_request", "merge_pull_request", "close_pull_request", "request_reviewers",
 				// Commit & ref mutations
 				"create_commit",
 				"create_branch", "delete_branch", "create_tag", "delete_tag",
@@ -298,7 +303,7 @@ func newProvider(opts ...Option) *Provider {
 				// Custom properties mutations
 				"set_custom_properties",
 			},
-			SensitiveFields: []string{"webhook_secret"},
+			SensitiveFields: []string{"webhook_secret", "token"},
 			Links: []sdkprovider.Link{
 				{Name: "GitHub GraphQL API", URL: "https://docs.github.com/en/graphql"},
 				{Name: "GitHub REST API", URL: "https://docs.github.com/en/rest"},
@@ -308,6 +313,9 @@ func newProvider(opts ...Option) *Provider {
 
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.client != nil {
+		installCrossOriginRedirectStripper(p.client)
 	}
 	return p
 }
@@ -336,14 +344,7 @@ func (p *Plugin) ConfigureProvider(_ context.Context, providerName string, cfg s
 		return fmt.Errorf("unknown provider: %s", providerName)
 	}
 
-	// Reset to defaults so that a reconfiguration call (or one that omits the
-	// httpClient block) always produces a consistent result rather than
-	// inheriting state from a prior call.
-	p.provider.allowPrivateIPs = false
-	// Invalidate any cached HTTP client so the next getClient call picks up
-	// the newly applied configuration.
-	p.provider.client = nil
-
+	var allowPrivateIPs bool
 	// Read httpClient settings from host.
 	if raw, ok := cfg.Settings["httpClient"]; ok {
 		var httpCfg struct {
@@ -352,7 +353,21 @@ func (p *Plugin) ConfigureProvider(_ context.Context, providerName string, cfg s
 		if err := json.Unmarshal(raw, &httpCfg); err != nil {
 			return fmt.Errorf("configuring provider %s: unmarshal httpClient settings: %w", providerName, err)
 		}
-		p.provider.allowPrivateIPs = httpCfg.AllowPrivateIPs
+		allowPrivateIPs = httpCfg.AllowPrivateIPs
+	}
+
+	// Reset to defaults so that a reconfiguration call (or one that omits the
+	// httpClient block) always produces a consistent result rather than
+	// inheriting state from a prior call, and invalidate any cached HTTP client
+	// so the next getClient call picks up the newly applied configuration.
+	p.provider.clientMu.Lock()
+	oldClient := p.provider.client
+	p.provider.allowPrivateIPs = allowPrivateIPs
+	p.provider.client = nil
+	p.provider.clientMu.Unlock()
+
+	if oldClient != nil {
+		_ = oldClient.Close()
 	}
 
 	return nil
@@ -391,6 +406,11 @@ func (*Plugin) DescribeWhatIf(_ context.Context, providerName string, inputs map
 			return fmt.Sprintf("Would perform GitHub %s on %s via fork %s/%s", operation, target, forkOrg, forkRepoName), nil
 		}
 	}
+	if operation == "request_reviewers" {
+		if num, ok := getIntInput(inputs, "number"); ok && num > 0 {
+			return fmt.Sprintf("Would perform GitHub %s on %s#%d", operation, target, num), nil
+		}
+	}
 	return fmt.Sprintf("Would perform GitHub %s on %s", operation, target), nil
 }
 
@@ -399,8 +419,17 @@ func (*Plugin) ExtractDependencies(_ context.Context, _ string, _ map[string]any
 	return nil, nil
 }
 
-// StopProvider is a no-op.
-func (*Plugin) StopProvider(_ context.Context, _ string) error {
+// StopProvider releases any cached HTTP client idle connections.
+func (p *Plugin) StopProvider(_ context.Context, providerName string) error {
+	if providerName == "" || providerName == ProviderName {
+		p.provider.clientMu.Lock()
+		oldClient := p.provider.client
+		p.provider.client = nil
+		p.provider.clientMu.Unlock()
+		if oldClient != nil {
+			_ = oldClient.Close()
+		}
+	}
 	return nil
 }
 
@@ -409,47 +438,27 @@ func (*Plugin) StopProvider(_ context.Context, _ string) error {
 // Auth tokens are obtained per-request via req.Context() which carries the fresh
 // HostClient injected by the SDK on each ExecuteProvider RPC.
 func (p *Provider) getClient() *httpc.Client {
+	p.clientMu.Lock()
+	defer p.clientMu.Unlock()
+
 	if p.client != nil {
 		return p.client
 	}
 	cfg := httpc.DefaultConfig()
 	cfg.EnableCache = false
-	cfg.AllowPrivateIPs = p.allowPrivateIPs
+	if p.allowPrivateIPs {
+		cfg.IPPolicy = httpc.AllowAllPrivateIPs()
+	}
 	cfg.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
 		if isGraphQLMutation(ctx) {
 			return false, nil
 		}
 		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
 	}
-	cfg.OnUnauthorized = func(innerCtx context.Context) (string, error) {
-		hostClient := sdkplugin.HostClientFromContext(innerCtx)
-		if hostClient == nil {
-			return "", fmt.Errorf("host service client not available for token refresh")
-		}
-		resp, err := hostClient.GetAuthToken(innerCtx, "github", "", 0, true)
-		if err != nil {
-			return "", fmt.Errorf("refreshing github token: %w", err)
-		}
-		return "Bearer " + resp.AccessToken, nil
-	}
-	cfg.RequestHooks = append(cfg.RequestHooks, func(req *http.Request) error {
-		reqCtx := req.Context()
-		hostClient := sdkplugin.HostClientFromContext(reqCtx)
-		if hostClient == nil {
-			lgr := logr.FromContextOrDiscard(reqCtx)
-			lgr.V(1).Info("host service client not available, making unauthenticated request")
-			return nil
-		}
-		resp, err := hostClient.GetAuthToken(reqCtx, "github", "", 0, false)
-		if err != nil {
-			lgr := logr.FromContextOrDiscard(reqCtx)
-			lgr.V(1).Info("GitHub auth token unavailable, making unauthenticated request", "error", err)
-			return nil
-		}
-		req.Header.Set("Authorization", "Bearer "+resp.AccessToken)
-		return nil
-	})
+	cfg.OnUnauthorized = refreshRequestAuth
+	cfg.RequestHooks = append(cfg.RequestHooks, injectRequestAuth)
 	p.client = httpc.NewClient(cfg)
+	installCrossOriginRedirectStripper(p.client)
 	return p.client
 }
 
@@ -462,6 +471,18 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 
 	if operation == "" {
 		return nil, fmt.Errorf("%s: 'operation' is required", ProviderName)
+	}
+
+	var err error
+	ctx, err = withRequestAuthOverride(ctx, inputs)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", ProviderName, err)
+	}
+
+	if rawPerPage, hasPerPage := inputs["per_page"]; hasPerPage && rawPerPage != nil {
+		if pp, ok := getIntInput(inputs, "per_page"); !ok || pp < 1 {
+			return nil, fmt.Errorf("%s: %s: 'per_page' must be an integer >= 1", ProviderName, operation)
+		}
 	}
 
 	// Dry-run support: return mock data for write operations
@@ -486,7 +507,6 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 	client := p.getClient()
 
 	var result *sdkprovider.Output
-	var err error
 
 	switch operation {
 	// --- Read operations (GraphQL) ---
@@ -519,9 +539,11 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 	case "get_head_oid":
 		result, err = p.executeGetHeadOID(ctx, client, apiBase, owner, repo, inputs)
 
-	// --- Review thread operations (GraphQL) ---
+	// --- Review thread & PR review operations (GraphQL) ---
 	case "list_review_threads":
 		result, err = p.executeListReviewThreads(ctx, client, apiBase, owner, repo, inputs)
+	case "list_pr_reviews":
+		result, err = p.executeListPRReviews(ctx, client, apiBase, owner, repo, inputs)
 	case "reply_to_review_thread":
 		result, err = p.executeReplyToReviewThread(ctx, client, apiBase, owner, repo, inputs)
 	case "resolve_review_thread":
@@ -532,6 +554,8 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 		result, err = p.executeListCheckRuns(ctx, client, apiBase, owner, repo, inputs)
 	case "get_workflow_run":
 		result, err = p.executeGetWorkflowRun(ctx, client, apiBase, owner, repo, inputs)
+	case "get_job_logs":
+		result, err = p.executeGetJobLogs(ctx, client, apiBase, owner, repo, inputs)
 
 	// --- Commit lookup operations (REST) ---
 	case "list_commit_pulls":
@@ -545,7 +569,7 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 	case "create_issue_comment":
 		result, err = p.executeCreateIssueComment(ctx, client, apiBase, owner, repo, inputs)
 
-	// --- PR write operations (GraphQL mutations) ---
+	// --- PR write operations (GraphQL + REST) ---
 	case "create_pull_request":
 		result, err = p.executeCreatePullRequest(ctx, client, apiBase, owner, repo, inputs)
 	case "update_pull_request":
@@ -554,6 +578,8 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 		result, err = p.executeMergePullRequest(ctx, client, apiBase, owner, repo, inputs)
 	case "close_pull_request":
 		result, err = p.executeClosePullRequest(ctx, client, apiBase, owner, repo, inputs)
+	case "request_reviewers":
+		result, err = p.executeRequestReviewers(ctx, client, apiBase, owner, repo, inputs)
 
 	// --- Commit & ref operations (GraphQL mutations) ---
 	case "create_commit":
@@ -791,7 +817,7 @@ func getStringInputWithAliases(inputs map[string]any, key string, aliases ...str
 
 // commonInputKeys are top-level inputs handled by execute before dispatch.
 // They are excluded from the "received inputs" list in error messages.
-var commonInputKeys = []string{"operation", "owner", "repo", "api_base", "token"}
+var commonInputKeys = []string{"operation", "owner", "repo", "api_base", "token", "auth_profile"}
 
 // requiredInputError builds an error for a missing required input, listing the
 // operation-specific keys the caller provided so the user can spot typos.
@@ -844,7 +870,9 @@ func getBoolInput(inputs map[string]any, key string) (bool, bool) {
 	return v, ok
 }
 
-// getIntInput extracts an integer from the input map, handling both float64 (from JSON) and int.
+// getIntInput extracts an exact integer from the input map, handling integral float64
+// values (from JSON) as well as int/int64/json.Number while rejecting fractional,
+// NaN, Inf, or out-of-range values.
 func getIntInput(inputs map[string]any, key string) (int, bool) {
 	v, ok := inputs[key]
 	if !ok {
@@ -852,14 +880,47 @@ func getIntInput(inputs map[string]any, key string) (int, bool) {
 	}
 	switch n := v.(type) {
 	case float64:
+		if math.IsNaN(n) || math.IsInf(n, 0) || math.Trunc(n) != n {
+			return 0, false
+		}
+		if n < float64(math.MinInt) || n >= -float64(math.MinInt) {
+			return 0, false
+		}
 		return int(n), true
 	case int:
 		return n, true
 	case int64:
-		return int(n), true
+		converted := int(n)
+		if int64(converted) != n {
+			return 0, false
+		}
+		return converted, true
+	case json.Number:
+		parsed, err := n.Int64()
+		if err != nil {
+			return 0, false
+		}
+		converted := int(parsed)
+		if int64(converted) != parsed {
+			return 0, false
+		}
+		return converted, true
 	default:
 		return 0, false
 	}
+}
+
+// requirePositiveIntInput validates that a required integer input is present and >= 1.
+func requirePositiveIntInput(inputs map[string]any, operation, key string) (int, error) {
+	raw, exists := inputs[key]
+	if !exists || raw == nil {
+		return 0, requiredInputError(operation, key, inputs, "")
+	}
+	val, ok := getIntInput(inputs, key)
+	if !ok || val < 1 {
+		return 0, fmt.Errorf("%s: '%s' must be an integer >= 1", operation, key)
+	}
+	return val, nil
 }
 
 // restError is returned when the GitHub REST API responds with an HTTP error status.
@@ -875,6 +936,10 @@ func (e *restError) Error() string {
 
 // doRESTRequest performs an authenticated REST API request and returns the parsed JSON.
 func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, method, url string, body any) (any, error) {
+	if client == nil {
+		return nil, fmt.Errorf("HTTP client is not initialized")
+	}
+
 	var bodyReader io.Reader
 	if body != nil {
 		bodyBytes, err := json.Marshal(body)
@@ -896,10 +961,12 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 	}
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("REST request failed: %w", err)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close() //nolint:errcheck // best-effort close
 	}
-	defer resp.Body.Close() //nolint:errcheck // best-effort close
+	if err != nil {
+		return nil, fmt.Errorf("REST request failed: %w", redactURLErrorQuery(err))
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -957,6 +1024,15 @@ func buildInputSchema() *jsonschema.Schema {
 				sdkhelper.WithDefault(defaultAPIBase),
 				sdkhelper.WithFormat("uri"),
 			),
+			"token": sdkhelper.StringProp("Optional per-step GitHub access token override (mutually exclusive with auth_profile)",
+				sdkhelper.WithWriteOnly(),
+				sdkhelper.WithMinLength(1),
+				sdkhelper.WithMaxLength(1000),
+			),
+			"auth_profile": sdkhelper.StringProp("Optional per-step GitHub auth profile name override (mutually exclusive with token)",
+				sdkhelper.WithMinLength(1),
+				sdkhelper.WithMaxLength(200),
+			),
 
 			// --- Read operation fields ---
 			"path": sdkhelper.StringProp("File path within the repository (for get_file)",
@@ -1005,11 +1081,25 @@ func buildInputSchema() *jsonschema.Schema {
 			),
 
 			// --- Review thread fields ---
-			"thread_id": sdkhelper.StringProp("Review thread node ID (for reply_to_review_thread and resolve_review_thread operations)"),
+			"thread_id":       sdkhelper.StringProp("Review thread node ID (for reply_to_review_thread and resolve_review_thread operations)"),
+			"unresolved_only": sdkhelper.BoolProp("Return only unresolved review threads (for list_review_threads)"),
 
 			// --- CI/CD fields ---
 			"run_id": sdkhelper.IntProp("Workflow run ID for get_workflow_run",
 				sdkhelper.WithMinimum(1),
+			),
+			"job_id": sdkhelper.IntProp("Workflow job ID for get_job_logs",
+				sdkhelper.WithMinimum(1),
+			),
+			"tail_lines": sdkhelper.IntProp("Number of trailing log lines to return for get_job_logs (0 returns all lines within max_bytes)",
+				sdkhelper.WithMinimum(0),
+				sdkhelper.WithMaximum(maxJobLogsTailLines),
+				sdkhelper.WithDefault(defaultJobLogsTailLines),
+			),
+			"max_bytes": sdkhelper.IntProp("Maximum trailing log bytes to retain for get_job_logs",
+				sdkhelper.WithMinimum(1),
+				sdkhelper.WithMaximum(maxJobLogsMaxBytes),
+				sdkhelper.WithDefault(defaultJobLogsMaxBytes),
 			),
 
 			// --- PR fields ---
@@ -1019,7 +1109,15 @@ func buildInputSchema() *jsonschema.Schema {
 			"base": sdkhelper.StringProp("Base branch name for creating/updating a pull request",
 				sdkhelper.WithMaxLength(200),
 			),
-			"draft": sdkhelper.BoolProp("Whether to create the pull request as a draft"),
+			"draft": sdkhelper.BoolProp("Whether the pull request is a draft (for create_pull_request and update_pull_request)"),
+			"team_reviewers": sdkhelper.ArrayProp("Team slugs to request pull request reviews from (for request_reviewers)",
+				sdkhelper.WithItems(sdkhelper.StringProp("Team slug")),
+				sdkhelper.WithMaxItems(100),
+			),
+			"bot_ids": sdkhelper.ArrayProp("Bot GraphQL node IDs to request pull request reviews from (for request_reviewers)",
+				sdkhelper.WithItems(sdkhelper.StringProp("Bot node ID")),
+				sdkhelper.WithMaxItems(100),
+			),
 			"merge_method": sdkhelper.StringProp("Merge method for merge_pull_request",
 				sdkhelper.WithEnum("MERGE", "SQUASH", "REBASE"),
 				sdkhelper.WithDefault("MERGE"),
@@ -1125,7 +1223,7 @@ func buildInputSchema() *jsonschema.Schema {
 			),
 			"required_approving_review_count": sdkhelper.IntProp("Minimum approving reviews required",
 				sdkhelper.WithMinimum(0),
-				sdkhelper.WithMaximum(10),
+				sdkhelper.WithMaximum(maxApprovingReviewCount),
 			),
 			"required_linear_history":    sdkhelper.BoolProp("Require linear commit history"),
 			"allow_force_pushes":         sdkhelper.BoolProp("Allow force pushes to matching refs"),
@@ -1185,10 +1283,13 @@ func buildInputSchema() *jsonschema.Schema {
 
 			// --- Environment fields ---
 			"environment_name": sdkhelper.StringProp("Deployment environment name", sdkhelper.WithMaxLength(200)),
-			"wait_timer":       sdkhelper.IntProp("Wait timer in minutes before deployments proceed", sdkhelper.WithMinimum(0), sdkhelper.WithMaximum(43200)),
-			"reviewers": sdkhelper.ArrayProp("Required reviewers for environment",
-				sdkhelper.WithItems(sdkhelper.ObjectProp("Reviewer object", nil, nil)),
-				sdkhelper.WithMaxItems(6),
+			"wait_timer":       sdkhelper.IntProp("Wait timer in minutes before deployments proceed", sdkhelper.WithMinimum(0), sdkhelper.WithMaximum(maxEnvironmentWaitTimer)),
+			"reviewers": sdkhelper.ArrayProp("Reviewer usernames (for request_reviewers) or required reviewer objects (for create_or_update_environment)",
+				sdkhelper.WithItems(&jsonschema.Schema{
+					Description: "Reviewer username string (for request_reviewers) or reviewer object (for create_or_update_environment)",
+					Types:       []string{"string", "object"},
+				}),
+				sdkhelper.WithMaxItems(100),
 			),
 
 			// --- Repo settings fields ---
@@ -1335,6 +1436,38 @@ branch: main
 data:
   app_name: my-app
   last_run: "2025-01-01T00:00:00Z"`,
+		},
+		{
+			Name:        "List pull request reviews",
+			Description: "Fetch paginated review submissions and commit OIDs for a pull request",
+			YAML: `operation: list_pr_reviews
+owner: my-org
+repo: my-repo
+number: 42`,
+		},
+		{
+			Name:        "Request pull request reviewers",
+			Description: "Request human, team, and bot reviewers on an open pull request",
+			YAML: `operation: request_reviewers
+owner: my-org
+repo: my-repo
+number: 42
+reviewers:
+  - octocat
+team_reviewers:
+  - platform-reviewers
+bot_ids:
+  - BOT_kgDOCnlnWA`,
+		},
+		{
+			Name:        "Fetch failed job logs with per-step auth profile",
+			Description: "Retrieve bounded trailing log lines from a GitHub Actions job using a named auth profile",
+			YAML: `operation: get_job_logs
+owner: work-org
+repo: service-repo
+job_id: 123456789
+tail_lines: 200
+auth_profile: secondary`,
 		},
 	}
 }

@@ -78,30 +78,72 @@ func (p *Provider) executeCreatePullRequest(ctx context.Context, client *httpc.C
 // ─── Update Pull Request ─────────────────────────────────────────────────────
 
 func (p *Provider) executeUpdatePullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
-	num, ok := getIntInput(inputs, "number")
-	if !ok || num == 0 {
-		return nil, requiredInputError("update_pull_request", "number", inputs, "")
+	num, err := requirePositiveIntInput(inputs, "update_pull_request", "number")
+	if err != nil {
+		return nil, err
 	}
 
-	prID, err := p.resolvePullRequestID(ctx, client, apiBase, owner, repo, num)
-	if err != nil {
-		return nil, fmt.Errorf("resolving pull request ID: %w", err)
+	var draftPtr *bool
+	if rawDraft, hasDraft := inputs["draft"]; hasDraft && rawDraft != nil {
+		d, isBool := rawDraft.(bool)
+		if !isBool {
+			return nil, fmt.Errorf("update_pull_request: 'draft' must be a boolean, got %T", rawDraft)
+		}
+		draftPtr = &d
 	}
+
+	prQuery := `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      number
+      title
+      state
+      isDraft
+      url
+      headRefName
+      baseRefName
+      updatedAt
+    }
+  }
+}`
+	stateData, err := graphqlDo(ctx, client, apiBase, prQuery, map[string]any{
+		"owner":  owner,
+		"name":   repo,
+		"number": num,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("resolving pull request: %w", err)
+	}
+	pr, err := extractNodeMap(stateData, "repository.pullRequest")
+	if err != nil {
+		return nil, fmt.Errorf("resolving pull request: %w", err)
+	}
+	prID, ok := pr["id"].(string)
+	if !ok || prID == "" {
+		return nil, fmt.Errorf("pull request #%d ID not found", num)
+	}
+	currentIsDraft, _ := pr["isDraft"].(bool)
 
 	mutInput := map[string]any{
 		"pullRequestId": prID,
 	}
+	hasFieldUpdate := false
 	if title := getStringInput(inputs, "title"); title != "" {
 		mutInput["title"] = title
+		hasFieldUpdate = true
 	}
 	if body := getStringInput(inputs, "body"); body != "" {
 		mutInput["body"] = body
+		hasFieldUpdate = true
 	}
 	if base := getStringInput(inputs, "base"); base != "" {
 		mutInput["baseRefName"] = base
+		hasFieldUpdate = true
 	}
 
-	mutation := `mutation($input: UpdatePullRequestInput!) {
+	if hasFieldUpdate {
+		mutation := `mutation($input: UpdatePullRequestInput!) {
   updatePullRequest(input: $input) {
     pullRequest {
       id
@@ -109,19 +151,77 @@ func (p *Provider) executeUpdatePullRequest(ctx context.Context, client *httpc.C
       title
       url
       state
+      isDraft
+      headRefName
+      baseRefName
       updatedAt
     }
   }
 }`
-
-	data, err := graphqlDo(ctx, client, apiBase, mutation, map[string]any{"input": mutInput})
-	if err != nil {
-		return nil, err
+		data, err := graphqlDo(ctx, client, apiBase, mutation, map[string]any{"input": mutInput})
+		if err != nil {
+			return nil, err
+		}
+		pr, err = extractNodeMap(data, "updatePullRequest.pullRequest")
+		if err != nil {
+			return nil, err
+		}
 	}
 
-	pr, err := extractNodeMap(data, "updatePullRequest.pullRequest")
-	if err != nil {
-		return nil, err
+	if draftPtr != nil && currentIsDraft != *draftPtr {
+		if *draftPtr {
+			draftMutation := `mutation($input: ConvertPullRequestToDraftInput!) {
+  convertPullRequestToDraft(input: $input) {
+    pullRequest {
+      id
+      number
+      title
+      url
+      state
+      isDraft
+      headRefName
+      baseRefName
+      updatedAt
+    }
+  }
+}`
+			data, err := graphqlDo(ctx, client, apiBase, draftMutation, map[string]any{
+				"input": map[string]any{"pullRequestId": prID},
+			})
+			if err != nil {
+				return nil, err
+			}
+			pr, err = extractNodeMap(data, "convertPullRequestToDraft.pullRequest")
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			readyMutation := `mutation($input: MarkPullRequestReadyForReviewInput!) {
+  markPullRequestReadyForReview(input: $input) {
+    pullRequest {
+      id
+      number
+      title
+      url
+      state
+      isDraft
+      headRefName
+      baseRefName
+      updatedAt
+    }
+  }
+}`
+			data, err := graphqlDo(ctx, client, apiBase, readyMutation, map[string]any{
+				"input": map[string]any{"pullRequestId": prID},
+			})
+			if err != nil {
+				return nil, err
+			}
+			pr, err = extractNodeMap(data, "markPullRequestReadyForReview.pullRequest")
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	return actionOutput("update_pull_request", pr), nil

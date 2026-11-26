@@ -28,9 +28,9 @@ func testProvider(t testing.TB, handler http.HandlerFunc) (*Provider, string) {
 	t.Cleanup(server.Close)
 
 	client := httpc.NewClient(&httpc.ClientConfig{
-		EnableCache:     false,
-		RetryMax:        0,
-		AllowPrivateIPs: true,
+		EnableCache: false,
+		RetryMax:    0,
+		IPPolicy:    httpc.AllowAllPrivateIPs(),
 	})
 	p := newProvider(
 		WithClient(client),
@@ -1432,7 +1432,7 @@ func TestProvider_Execute_HTTPError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := httpc.NewClient(&httpc.ClientConfig{EnableCache: false, RetryMax: 0, AllowPrivateIPs: true})
+	client := httpc.NewClient(&httpc.ClientConfig{EnableCache: false, RetryMax: 0, IPPolicy: httpc.AllowAllPrivateIPs()})
 	p := newProvider(WithClient(client))
 
 	_, err := p.execute(context.Background(), map[string]any{

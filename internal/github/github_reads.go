@@ -265,14 +265,29 @@ func (p *Provider) executeGetPullRequest(ctx context.Context, client *httpc.Clie
       closedAt
       author { login }
       headRefName
+      headRefOid
       baseRefName
+      baseRefOid
       isDraft
       mergeable
+      mergeStateStatus
       merged
+      mergeCommit { oid }
       additions
       deletions
       changedFiles
       reviewDecision
+      reviewRequests(first: 20) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User { login }
+            ... on Team { name slug }
+            ... on Bot { id login }
+            ... on Mannequin { login }
+          }
+        }
+      }
       commits { totalCount }
       comments { totalCount }
       reviews { totalCount }
@@ -316,8 +331,9 @@ func (p *Provider) executeGetPullRequest(ctx context.Context, client *httpc.Clie
 		return nil, err
 	}
 
-	// Flatten statusCheckRollup into a top-level field
+	// Flatten statusCheckRollup and reviewRequests into top-level fields
 	flattenStatusCheckRollup(pr)
+	flattenReviewRequests(pr)
 
 	return readOutput(pr), nil
 }
@@ -708,4 +724,32 @@ func flattenStatusCheckRollup(pr map[string]any) {
 		}
 	}
 	pr["statusCheckRollup"] = result
+}
+
+// flattenReviewRequests extracts requestedReviewer objects from the GraphQL
+// reviewRequests connection into a non-nil []map[string]any slice.
+func flattenReviewRequests(pr map[string]any) {
+	flattened := make([]map[string]any, 0)
+	raw, ok := pr["reviewRequests"].(map[string]any)
+	if !ok {
+		pr["reviewRequests"] = flattened
+		return
+	}
+	nodes, ok := raw["nodes"].([]any)
+	if !ok {
+		pr["reviewRequests"] = flattened
+		return
+	}
+	for _, n := range nodes {
+		nodeMap, ok := n.(map[string]any)
+		if !ok {
+			continue
+		}
+		reviewer, ok := nodeMap["requestedReviewer"].(map[string]any)
+		if !ok || len(reviewer) == 0 {
+			continue
+		}
+		flattened = append(flattened, reviewer)
+	}
+	pr["reviewRequests"] = flattened
 }

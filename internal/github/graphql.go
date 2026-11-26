@@ -101,6 +101,10 @@ func graphqlEndpoint(apiBase string) string {
 // graphqlDo sends a GraphQL query or mutation to the GitHub API and returns the data portion.
 // It handles auth header injection, response parsing, and GraphQL-level error checking.
 func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string, variables map[string]any) (map[string]any, error) {
+	if client == nil {
+		return nil, fmt.Errorf("HTTP client is not initialized")
+	}
+
 	lgr := logr.FromContextOrDiscard(ctx)
 
 	endpoint := graphqlEndpoint(apiBase)
@@ -129,10 +133,12 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GraphQL request failed: %w", err)
+	if resp != nil && resp.Body != nil {
+		defer resp.Body.Close() //nolint:errcheck // best-effort close
 	}
-	defer resp.Body.Close() //nolint:errcheck // best-effort close
+	if err != nil {
+		return nil, fmt.Errorf("GraphQL request failed: %w", redactURLErrorQuery(err))
+	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {

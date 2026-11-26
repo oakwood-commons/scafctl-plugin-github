@@ -173,6 +173,12 @@ func (p *Provider) executeListEnvironments(ctx context.Context, client *httpc.Cl
 
 // ─── Create or Update Environment ────────────────────────────────────────────
 
+const (
+	maxEnvironmentReviewers = 6
+	// maxEnvironmentWaitTimer is GitHub's upper bound for deployment environment wait_timer (30 days in minutes).
+	maxEnvironmentWaitTimer = 43200
+)
+
 func (p *Provider) executeCreateOrUpdateEnvironment(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
 	envName := getStringInput(inputs, "environment_name")
 	if envName == "" {
@@ -180,10 +186,42 @@ func (p *Provider) executeCreateOrUpdateEnvironment(ctx context.Context, client 
 	}
 
 	reqBody := map[string]any{}
-	if reviewers, ok := inputs["reviewers"].([]any); ok && len(reviewers) > 0 {
-		reqBody["reviewers"] = reviewers
+	if rawReviewers, hasReviewers := inputs["reviewers"]; hasReviewers && rawReviewers != nil {
+		switch typed := rawReviewers.(type) {
+		case []any:
+			if len(typed) > maxEnvironmentReviewers {
+				return nil, fmt.Errorf("create_or_update_environment: at most %d reviewers are supported, got %d", maxEnvironmentReviewers, len(typed))
+			}
+			for i, item := range typed {
+				m, isMap := item.(map[string]any)
+				if !isMap || m == nil {
+					return nil, fmt.Errorf("create_or_update_environment: reviewers[%d] must be a non-null object, got %T", i, item)
+				}
+			}
+			if len(typed) > 0 {
+				reqBody["reviewers"] = typed
+			}
+		case []map[string]any:
+			if len(typed) > maxEnvironmentReviewers {
+				return nil, fmt.Errorf("create_or_update_environment: at most %d reviewers are supported, got %d", maxEnvironmentReviewers, len(typed))
+			}
+			for i, m := range typed {
+				if m == nil {
+					return nil, fmt.Errorf("create_or_update_environment: reviewers[%d] must be a non-null object", i)
+				}
+			}
+			if len(typed) > 0 {
+				reqBody["reviewers"] = typed
+			}
+		default:
+			return nil, fmt.Errorf("create_or_update_environment: 'reviewers' must be an array of objects, got %T", rawReviewers)
+		}
 	}
-	if waitTimer, ok := getIntInput(inputs, "wait_timer"); ok {
+	if rawWaitTimer, hasWaitTimer := inputs["wait_timer"]; hasWaitTimer && rawWaitTimer != nil {
+		waitTimer, ok := getIntInput(inputs, "wait_timer")
+		if !ok || waitTimer < 0 || waitTimer > maxEnvironmentWaitTimer {
+			return nil, fmt.Errorf("create_or_update_environment: 'wait_timer' must be an integer between 0 and %d", maxEnvironmentWaitTimer)
+		}
 		reqBody["wait_timer"] = waitTimer
 	}
 
