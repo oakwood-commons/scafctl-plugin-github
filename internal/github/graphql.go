@@ -120,10 +120,15 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 		return nil, fmt.Errorf("marshaling GraphQL request: %w", err)
 	}
 
-	requestCtx := ctx
+	requestCtx, _ := withRequestAuthState(ctx)
 	if strings.HasPrefix(strings.TrimSpace(query), "mutation") {
-		requestCtx = context.WithValue(ctx, graphqlMutationContextKey{}, true)
+		requestCtx = context.WithValue(requestCtx, graphqlMutationContextKey{}, true)
 	}
+	requestCtx, err = ensureGraphQLAuth(requestCtx, client)
+	if err != nil {
+		return nil, err
+	}
+
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, endpoint, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("creating GraphQL request: %w", err)
@@ -131,6 +136,9 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	if tok := prefetchedTokenFromContext(requestCtx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
 
 	resp, err := client.Do(req)
 	if resp != nil && resp.Body != nil {
@@ -147,14 +155,18 @@ func graphqlDo(ctx context.Context, client *httpc.Client, apiBase, query string,
 
 	// HTTP-level errors (e.g., 401, 403, 500)
 	if resp.StatusCode >= 400 {
-		// Try to extract a useful message from the JSON body
+		msg := string(respBody)
 		var errResp map[string]any
 		if json.Unmarshal(respBody, &errResp) == nil {
-			if msg, ok := errResp["message"].(string); ok {
-				return nil, fmt.Errorf("GitHub GraphQL API error (HTTP %d): %s", resp.StatusCode, msg)
+			if m, ok := errResp["message"].(string); ok {
+				msg = m
 			}
 		}
-		return nil, fmt.Errorf("GitHub GraphQL API error (HTTP %d): %s", resp.StatusCode, string(respBody))
+		apiErr := fmt.Errorf("GitHub GraphQL API error (HTTP %d): %s", resp.StatusCode, msg)
+		if shouldAddUnauthenticatedHint(requestCtx, req, resp) {
+			return nil, wrapUnauthenticatedHTTPError(resp.StatusCode, apiErr)
+		}
+		return nil, apiErr
 	}
 
 	// Parse GraphQL response

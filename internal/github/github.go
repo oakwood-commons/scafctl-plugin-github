@@ -458,6 +458,7 @@ func (p *Provider) getClient() *httpc.Client {
 	cfg.OnUnauthorized = refreshRequestAuth
 	cfg.RequestHooks = append(cfg.RequestHooks, injectRequestAuth)
 	p.client = httpc.NewClient(cfg)
+	registerHostAuthClient(p.client)
 	installCrossOriginRedirectStripper(p.client)
 	return p.client
 }
@@ -949,7 +950,8 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	requestCtx, _ := withRequestAuthState(ctx)
+	req, err := http.NewRequestWithContext(requestCtx, method, url, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("creating REST request: %w", err)
 	}
@@ -981,7 +983,11 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 				msg = m
 			}
 		}
-		return nil, &restError{StatusCode: resp.StatusCode, Message: msg}
+		re := &restError{StatusCode: resp.StatusCode, Message: msg}
+		if shouldAddUnauthenticatedHint(requestCtx, req, resp) {
+			return nil, wrapUnauthenticatedHTTPError(resp.StatusCode, re)
+		}
+		return nil, re
 	}
 
 	// DELETE with 204 No Content

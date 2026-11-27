@@ -170,6 +170,8 @@ actions:
 
 Authentication is handled automatically via the configured `github` auth handler in scafctl. No manual token configuration is needed for single-account runs.
 
+GraphQL operations always require authentication and fail fast with login guidance (`scafctl auth login github`, `GITHUB_TOKEN`, or `token`) when no credentials are available. Unauthenticated REST operations against public repositories proceed without a token and include the same login guidance if GitHub responds with HTTP 401 or 403.
+
 For multi-account or multi-organization workflows, individual steps can override credentials using either `auth_profile` or `token` (mutually exclusive):
 
 - `auth_profile`: selects a named profile from the host `github` auth handler for that step (for example `auth_profile: secondary`).
