@@ -5,18 +5,173 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"weak"
 
 	"github.com/go-logr/logr"
 	"github.com/oakwood-commons/httpc"
 	sdkplugin "github.com/oakwood-commons/scafctl-plugin-sdk/plugin"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
-type requestAuthOverrideKey struct{}
+const authGuidanceHint = "run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'"
+
+type (
+	requestAuthOverrideKey struct{}
+	requestAuthStateKey    struct{}
+	prefetchedTokenKey     struct{}
+)
+
+// requestAuthState records whether an outbound HTTP request carried GitHub credentials
+// across httpc request hooks, auth-refresh retries, and cross-origin redirects.
+type requestAuthState struct {
+	authenticated atomic.Bool
+}
+
+func withRequestAuthState(ctx context.Context) (context.Context, *requestAuthState) {
+	st := &requestAuthState{}
+	return context.WithValue(ctx, requestAuthStateKey{}, st), st
+}
+
+func authStateFromContext(ctx context.Context) *requestAuthState {
+	st, _ := ctx.Value(requestAuthStateKey{}).(*requestAuthState)
+	return st
+}
+
+func markRequestAuthenticated(ctx context.Context) {
+	if st := authStateFromContext(ctx); st != nil {
+		st.authenticated.Store(true)
+	}
+}
+
+func prefetchedTokenFromContext(ctx context.Context) string {
+	tok, _ := ctx.Value(prefetchedTokenKey{}).(string)
+	return tok
+}
+
+// hostAuthClients tracks httpc.Client instances constructed by Provider.getClient
+// via weak pointers for their entire lifetime (cleaned up on garbage collection)
+// so ambient HostService GraphQL preflight runs on every default host-authenticated
+// client -- including one retained by an in-flight call across ConfigureProvider or
+// StopProvider -- without blocking custom WithClient hooks.
+var hostAuthClients sync.Map
+
+func registerHostAuthClient(c *httpc.Client) {
+	if c == nil {
+		return
+	}
+	wp := weak.Make(c)
+	hostAuthClients.Store(wp, struct{}{})
+	runtime.AddCleanup(c, func(k weak.Pointer[httpc.Client]) {
+		hostAuthClients.Delete(k)
+	}, wp)
+	runtime.KeepAlive(c)
+}
+
+func isHostAuthClient(c *httpc.Client) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := hostAuthClients.Load(weak.Make(c))
+	runtime.KeepAlive(c)
+	return ok
+}
+
+// ensureGraphQLAuth verifies that ambient GitHub credentials are available before
+// issuing a GraphQL request on the provider's default host-authenticated client
+// when no explicit per-step token or auth_profile override is set. Custom clients
+// supplied via WithClient bypass this preflight so their own authentication hooks
+// can execute. Any fetched ambient token is cached on the returned context so
+// injectRequestAuth reuses it without a duplicate RPC.
+func ensureGraphQLAuth(ctx context.Context, client *httpc.Client) (context.Context, error) {
+	if !isHostAuthClient(client) {
+		return ctx, nil
+	}
+
+	ov := authOverrideFromContext(ctx)
+	if ov.token != "" || ov.authProfile != "" {
+		return ctx, nil
+	}
+
+	hostClient := sdkplugin.HostClientFromContext(ctx)
+	if hostClient == nil {
+		return ctx, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return ctx, fmt.Errorf("getting github auth token: %w", err)
+	}
+
+	resp, err := hostClient.GetAuthTokenWithOptions(ctx, sdkplugin.AuthTokenRequest{
+		Handler: "github",
+	})
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctx, fmt.Errorf("getting github auth token: %w (%w)", err, ctxErr)
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return ctx, fmt.Errorf("getting github auth token: %w", err)
+		}
+		var grpcErr interface{ GRPCStatus() *status.Status }
+		if errors.As(err, &grpcErr) {
+			if c := grpcErr.GRPCStatus().Code(); c == codes.Canceled || c == codes.DeadlineExceeded {
+				return ctx, fmt.Errorf("getting github auth token: %w", err)
+			}
+		}
+		return ctx, fmt.Errorf("not authenticated with GitHub: %s: %w", authGuidanceHint, err)
+	}
+	if resp == nil || strings.TrimSpace(resp.AccessToken) == "" {
+		return ctx, fmt.Errorf("not authenticated with GitHub: %s", authGuidanceHint)
+	}
+
+	tok := strings.TrimSpace(resp.AccessToken)
+	markRequestAuthenticated(ctx)
+	return context.WithValue(ctx, prefetchedTokenKey{}, tok), nil
+}
+
+// wasRequestAuthenticated reports whether credentials were attached to the request.
+func wasRequestAuthenticated(ctx context.Context, req *http.Request, resp *http.Response) bool {
+	if st := authStateFromContext(ctx); st != nil && st.authenticated.Load() {
+		return true
+	}
+	if req != nil && strings.TrimSpace(req.Header.Get("Authorization")) != "" {
+		return true
+	}
+	if resp != nil && resp.Request != nil && strings.TrimSpace(resp.Request.Header.Get("Authorization")) != "" {
+		return true
+	}
+	return false
+}
+
+// shouldAddUnauthenticatedHint reports whether an HTTP response is an unauthenticated
+// 401 or 403 from the GitHub API origin that warrants login guidance.
+func shouldAddUnauthenticatedHint(ctx context.Context, req *http.Request, resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+		return false
+	}
+	if wasRequestAuthenticated(ctx, req, resp) {
+		return false
+	}
+	if req != nil && req.URL != nil && resp.Request != nil && resp.Request.URL != nil && !sameSchemeAndHost(req.URL, resp.Request.URL) {
+		return false
+	}
+	return true
+}
+
+func wrapUnauthenticatedHTTPError(statusCode int, err error) error {
+	return fmt.Errorf("not authenticated with GitHub (HTTP %d): %s: %w", statusCode, authGuidanceHint, err)
+}
 
 // requestAuthOverride carries per-execution credential overrides on request contexts
 // so a single pooled httpc.Client remains safe for concurrent steps using distinct identities.
@@ -80,6 +235,13 @@ func injectRequestAuth(req *http.Request) error {
 
 	if ov.token != "" {
 		req.Header.Set("Authorization", "Bearer "+ov.token)
+		markRequestAuthenticated(reqCtx)
+		return nil
+	}
+
+	if tok := prefetchedTokenFromContext(reqCtx); tok != "" {
+		req.Header.Set("Authorization", "Bearer "+tok)
+		markRequestAuthenticated(reqCtx)
 		return nil
 	}
 
@@ -98,7 +260,8 @@ func injectRequestAuth(req *http.Request) error {
 		if resp == nil || strings.TrimSpace(resp.AccessToken) == "" {
 			return fmt.Errorf("empty github token returned for auth_profile %q", ov.authProfile)
 		}
-		req.Header.Set("Authorization", "Bearer "+resp.AccessToken)
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(resp.AccessToken))
+		markRequestAuthenticated(reqCtx)
 		return nil
 	}
 
@@ -115,8 +278,9 @@ func injectRequestAuth(req *http.Request) error {
 		lgr.V(1).Info("GitHub auth token unavailable, making unauthenticated request", "error", err)
 		return nil
 	}
-	if resp != nil && resp.AccessToken != "" {
-		req.Header.Set("Authorization", "Bearer "+resp.AccessToken)
+	if resp != nil && strings.TrimSpace(resp.AccessToken) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(resp.AccessToken))
+		markRequestAuthenticated(reqCtx)
 	}
 	return nil
 }
@@ -126,6 +290,13 @@ func refreshRequestAuth(reqCtx context.Context) (string, error) {
 	ov := authOverrideFromContext(reqCtx)
 	if ov.token != "" {
 		// Explicit per-step token must never fall back to or refresh ambient host credentials on 401.
+		return "", nil
+	}
+
+	// When a tracked request was sent without credentials and no auth_profile was requested,
+	// there is no session token to refresh; let the 401 response pass through so the caller
+	// surfaces actionable authentication guidance.
+	if st := authStateFromContext(reqCtx); st != nil && !st.authenticated.Load() && ov.authProfile == "" {
 		return "", nil
 	}
 
@@ -155,7 +326,8 @@ func refreshRequestAuth(reqCtx context.Context) (string, error) {
 	if resp == nil || strings.TrimSpace(resp.AccessToken) == "" {
 		return "", fmt.Errorf("empty refreshed github token")
 	}
-	return "Bearer " + resp.AccessToken, nil
+	markRequestAuthenticated(reqCtx)
+	return "Bearer " + strings.TrimSpace(resp.AccessToken), nil
 }
 
 // installCrossOriginRedirectStripper wraps client's underlying CheckRedirect hook so

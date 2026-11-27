@@ -250,7 +250,8 @@ func (p *Provider) executeGetJobLogs(ctx context.Context, client *httpc.Client, 
 	}
 
 	logsURL := fmt.Sprintf("%s/repos/%s/%s/actions/jobs/%d/logs", apiBase, url.PathEscape(owner), url.PathEscape(repo), jobID)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, logsURL, nil)
+	requestCtx, _ := withRequestAuthState(ctx)
+	req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, logsURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating job logs request: %w", err)
 	}
@@ -274,7 +275,11 @@ func (p *Provider) executeGetJobLogs(ctx context.Context, client *httpc.Client, 
 				msg = m
 			}
 		}
-		return nil, fmt.Errorf("fetching job logs: %w", &restError{StatusCode: resp.StatusCode, Message: msg})
+		var apiErr error = &restError{StatusCode: resp.StatusCode, Message: msg}
+		if shouldAddUnauthenticatedHint(requestCtx, req, resp) {
+			apiErr = wrapUnauthenticatedHTTPError(resp.StatusCode, apiErr)
+		}
+		return nil, fmt.Errorf("fetching job logs: %w", apiErr)
 	}
 
 	logsText, truncated, totalBytes, returnedLines, err := readLogTail(resp.Body, maxBytes, tailLines)

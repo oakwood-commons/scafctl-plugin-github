@@ -24,7 +24,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 type mockAuthHostService struct {
@@ -61,7 +63,7 @@ func (m *mockAuthHostService) getRequests() []*proto.GetAuthTokenRequest {
 	return out
 }
 
-func startTestAuthHostClient(t *testing.T, fn func(req *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error)) (*mockAuthHostService, *sdkplugin.HostServiceClient) {
+func startTestAuthHostClient(t testing.TB, fn func(req *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error)) (*mockAuthHostService, *sdkplugin.HostServiceClient) {
 	t.Helper()
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -715,11 +717,20 @@ func TestRedactURLErrorQuery_EdgeCasesAndUnwrap(t *testing.T) {
 func TestPlugin_ConcurrentConfigureStopAndExecute(t *testing.T) {
 	t.Parallel()
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	var unauthenticatedRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			unauthenticatedRequests.Add(1)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":{"repository":{"name":"demo","nameWithOwner":"acme-corp/demo"}}}`))
 	}))
 	t.Cleanup(srv.Close)
+
+	_, unauthHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+		return &proto.GetAuthTokenResponse{Error: "no active session for github"}, nil
+	})
+	unauthCtx := sdkplugin.WithHostClient(context.Background(), unauthHC)
 
 	rawCfg, err := json.Marshal(map[string]any{"allowPrivateIPs": true})
 	require.NoError(t, err)
@@ -731,16 +742,24 @@ func TestPlugin_ConcurrentConfigureStopAndExecute(t *testing.T) {
 	require.NoError(t, plug.ConfigureProvider(context.Background(), ProviderName, cfg))
 
 	var wg sync.WaitGroup
-	for i := range 12 {
+	for i := range 16 {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			switch idx % 3 {
+			switch idx % 4 {
 			case 0:
 				_ = plug.ConfigureProvider(context.Background(), ProviderName, cfg)
 			case 1:
 				_ = plug.StopProvider(context.Background(), ProviderName)
 				_ = plug.ConfigureProvider(context.Background(), ProviderName, cfg)
+			case 2:
+				_, execErr := plug.ExecuteProvider(unauthCtx, ProviderName, map[string]any{
+					"operation": "get_repo",
+					"owner":     "acme-corp",
+					"repo":      "demo",
+					"api_base":  srv.URL,
+				})
+				assert.Error(t, execErr)
 			default:
 				_, _ = plug.ExecuteProvider(context.Background(), ProviderName, map[string]any{
 					"operation": "get_repo",
@@ -753,6 +772,7 @@ func TestPlugin_ConcurrentConfigureStopAndExecute(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	assert.Equal(t, int32(0), unauthenticatedRequests.Load(), "unauthenticated GraphQL call must never reach HTTP server across concurrent reconfiguration")
 }
 
 func BenchmarkExecuteWithTokenOverride(b *testing.B) {
@@ -776,5 +796,541 @@ func BenchmarkExecuteWithTokenOverride(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		_, _ = p.execute(context.Background(), inputs)
+	}
+}
+
+func TestGraphQLDo_PreFlightFailsFastWhenUnauthenticated(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		hostHandler func(req *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error)
+		wantErrSub  string
+	}{
+		{
+			name: "host auth handler returns not authenticated error",
+			hostHandler: func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+				return &proto.GetAuthTokenResponse{Error: "no active session for github"}, nil
+			},
+			wantErrSub: "no active session for github",
+		},
+		{
+			name: "host auth handler returns empty token",
+			hostHandler: func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+				return &proto.GetAuthTokenResponse{AccessToken: ""}, nil
+			},
+		},
+		{
+			name: "host auth handler returns whitespace token",
+			hostHandler: func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+				return &proto.GetAuthTokenResponse{AccessToken: "   \t "}, nil
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var serverHits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				serverHits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			svc, hc := startTestAuthHostClient(t, tc.hostHandler)
+
+			p := newProvider()
+			p.allowPrivateIPs = true
+
+			ctx := sdkplugin.WithHostClient(context.Background(), hc)
+			_, err := p.execute(ctx, map[string]any{
+				"operation": "get_issue",
+				"owner":     "oakwood-commons",
+				"repo":      "scafctl",
+				"number":    1,
+				"api_base":  srv.URL,
+			})
+			require.Error(t, err)
+			assert.Equal(t, int32(0), serverHits.Load(), "GraphQL pre-flight must fail before any HTTP request is sent")
+			assert.Len(t, svc.getRequests(), 1, "host auth RPC should be queried exactly once")
+			assert.Contains(t, err.Error(), "not authenticated with GitHub: run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'")
+			if tc.wantErrSub != "" {
+				assert.Contains(t, err.Error(), tc.wantErrSub)
+			}
+		})
+	}
+
+	t.Run("cancelled context propagates cancellation instead of auth guidance", func(t *testing.T) {
+		t.Parallel()
+
+		var serverHits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			serverHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		_, hc := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{AccessToken: "valid-tok"}, nil
+		})
+
+		p := newProvider()
+		p.allowPrivateIPs = true
+
+		cancelCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		ctx := sdkplugin.WithHostClient(cancelCtx, hc)
+
+		_, err := graphqlDo(ctx, p.getClient(), srv.URL, "query { viewer { login } }", nil)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.NotContains(t, err.Error(), "not authenticated with GitHub")
+		assert.Equal(t, int32(0), serverHits.Load())
+
+		// Also verify gRPC Canceled / DeadlineExceeded returned mid-RPC is not misreported as missing login.
+		_, rpcCancelHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return nil, status.Error(codes.DeadlineExceeded, "host RPC deadline exceeded")
+		})
+		_, rpcErr := graphqlDo(sdkplugin.WithHostClient(context.Background(), rpcCancelHC), p.getClient(), srv.URL, "query { viewer { login } }", nil)
+		require.Error(t, rpcErr)
+		assert.NotContains(t, rpcErr.Error(), "not authenticated with GitHub")
+		assert.Equal(t, int32(0), serverHits.Load())
+	})
+
+	t.Run("custom WithClient auth hook succeeds on GraphQL when host client is unauthenticated", func(t *testing.T) {
+		t.Parallel()
+
+		var serverHits atomic.Int32
+		var sawAuth atomic.Value
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			serverHits.Add(1)
+			sawAuth.Store(r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": map[string]any{
+					"repository": map[string]any{
+						"name":          "demo",
+						"nameWithOwner": "public-org/demo",
+					},
+				},
+			})
+		}))
+		t.Cleanup(srv.Close)
+
+		svc, unauthHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{Error: "no active session for github"}, nil
+		})
+
+		customClient := httpc.NewClient(&httpc.ClientConfig{
+			EnableCache: false,
+			RetryMax:    0,
+			IPPolicy:    httpc.AllowAllPrivateIPs(),
+			RequestHooks: []httpc.RequestHook{
+				func(req *http.Request) error {
+					req.Header.Set("Authorization", "Bearer custom-hook-val")
+					return nil
+				},
+			},
+		})
+		t.Cleanup(func() { _ = customClient.Close() })
+
+		p := newProvider(WithClient(customClient))
+		ctx := sdkplugin.WithHostClient(context.Background(), unauthHC)
+
+		out, err := p.execute(ctx, map[string]any{
+			"operation": "get_repo",
+			"owner":     "public-org",
+			"repo":      "demo",
+			"api_base":  srv.URL,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, out)
+		assert.Equal(t, int32(1), serverHits.Load())
+		assert.Equal(t, "Bearer custom-hook-val", sawAuth.Load())
+		assert.Empty(t, svc.getRequests(), "custom WithClient GraphQL call must not preflight ambient HostService")
+	})
+
+	t.Run("retained default client still fails preflight after ConfigureProvider and StopProvider", func(t *testing.T) {
+		t.Parallel()
+
+		var serverHits atomic.Int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			serverHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+
+		svc, unauthHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{Error: "no active session for github"}, nil
+		})
+
+		rawCfg, cfgErr := json.Marshal(map[string]any{"allowPrivateIPs": true})
+		require.NoError(t, cfgErr)
+		cfg := sdkplugin.ProviderConfig{
+			Settings: map[string]json.RawMessage{"httpClient": rawCfg},
+		}
+
+		plug := NewPlugin()
+		require.NoError(t, plug.ConfigureProvider(context.Background(), ProviderName, cfg))
+
+		retainedClient := plug.provider.getClient()
+		require.NoError(t, plug.ConfigureProvider(context.Background(), ProviderName, cfg))
+		require.NoError(t, plug.StopProvider(context.Background(), ProviderName))
+
+		ctx := sdkplugin.WithHostClient(context.Background(), unauthHC)
+		_, err := graphqlDo(ctx, retainedClient, srv.URL, "query { viewer { login } }", nil)
+		require.Error(t, err)
+		assert.Equal(t, int32(0), serverHits.Load(), "retained default client must still fail preflight before sending any HTTP request")
+		assert.Len(t, svc.getRequests(), 1)
+		assert.Contains(t, err.Error(), "not authenticated with GitHub: run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'")
+	})
+}
+
+func TestUnauthenticatedHTTPErrorGuidance(t *testing.T) {
+	t.Parallel()
+
+	t.Run("graphqlDo unauthenticated 401 and 403 include auth guidance", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name       string
+			statusCode int
+			apiMessage string
+		}{
+			{
+				name:       "HTTP 401 Unauthorized",
+				statusCode: http.StatusUnauthorized,
+				apiMessage: "Requires authentication",
+			},
+			{
+				name:       "HTTP 403 Forbidden rate limit",
+				statusCode: http.StatusForbidden,
+				apiMessage: "API rate limit exceeded",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.statusCode)
+					_ = json.NewEncoder(w).Encode(map[string]any{"message": tc.apiMessage})
+				}))
+				t.Cleanup(srv.Close)
+
+				p := newProvider()
+				p.allowPrivateIPs = true
+
+				_, err := graphqlDo(context.Background(), p.getClient(), srv.URL, "query { viewer { login } }", nil)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), fmt.Sprintf("not authenticated with GitHub (HTTP %d): run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'", tc.statusCode))
+				assert.Contains(t, err.Error(), tc.apiMessage)
+			})
+		}
+	})
+
+	t.Run("doRESTRequest and executeGetJobLogs unauthenticated 401 and 403 include auth guidance and preserve restError", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name           string
+			statusCode     int
+			apiMessage     string
+			withHostNoAuth bool
+		}{
+			{
+				name:       "HTTP 401 without host client",
+				statusCode: http.StatusUnauthorized,
+				apiMessage: "Requires authentication",
+			},
+			{
+				name:       "HTTP 403 without host client",
+				statusCode: http.StatusForbidden,
+				apiMessage: "API rate limit exceeded for 203.0.113.10",
+			},
+			{
+				name:           "HTTP 401 with unauthenticated host client",
+				statusCode:     http.StatusUnauthorized,
+				apiMessage:     "Requires authentication",
+				withHostNoAuth: true,
+			},
+			{
+				name:           "HTTP 403 with unauthenticated host client",
+				statusCode:     http.StatusForbidden,
+				apiMessage:     "Resource not accessible without authentication",
+				withHostNoAuth: true,
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.statusCode)
+					_ = json.NewEncoder(w).Encode(map[string]any{"message": tc.apiMessage})
+				}))
+				t.Cleanup(srv.Close)
+
+				p := newProvider()
+				p.allowPrivateIPs = true
+
+				ctx := context.Background()
+				if tc.withHostNoAuth {
+					_, hc := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+						return &proto.GetAuthTokenResponse{Error: "not logged in"}, nil
+					})
+					ctx = sdkplugin.WithHostClient(ctx, hc)
+				}
+
+				_, err := p.doRESTRequest(ctx, p.getClient(), http.MethodGet, srv.URL+"/repos/public-org/demo/labels", nil)
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), fmt.Sprintf("not authenticated with GitHub (HTTP %d): run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'", tc.statusCode))
+				assert.Contains(t, err.Error(), tc.apiMessage)
+
+				var re *restError
+				require.ErrorAs(t, err, &re)
+				assert.Equal(t, tc.statusCode, re.StatusCode)
+				assert.Equal(t, tc.apiMessage, re.Message)
+
+				// Verify executeGetJobLogs also enriches unauthenticated 401/403 while wrapping restError.
+				_, logsErr := p.execute(ctx, map[string]any{
+					"operation": "get_job_logs",
+					"owner":     "public-org",
+					"repo":      "demo",
+					"job_id":    101,
+					"api_base":  srv.URL,
+				})
+				require.Error(t, logsErr)
+				assert.Contains(t, logsErr.Error(), fmt.Sprintf("not authenticated with GitHub (HTTP %d): run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'", tc.statusCode))
+				var logsRE *restError
+				require.ErrorAs(t, logsErr, &logsRE)
+				assert.Equal(t, tc.statusCode, logsRE.StatusCode)
+			})
+		}
+	})
+
+	t.Run("unauthenticated REST 200 OK against public repository still succeeds when host client has no token", func(t *testing.T) {
+		t.Parallel()
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Empty(t, r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode([]any{map[string]any{"name": "bug"}})
+		}))
+		t.Cleanup(srv.Close)
+
+		_, hc := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{Error: "not logged in"}, nil
+		})
+
+		p := newProvider()
+		p.allowPrivateIPs = true
+
+		ctx := sdkplugin.WithHostClient(context.Background(), hc)
+		out, err := p.execute(ctx, map[string]any{
+			"operation": "list_labels",
+			"owner":     "public-org",
+			"repo":      "demo",
+			"api_base":  srv.URL,
+		})
+		require.NoError(t, err)
+		require.NotNil(t, out)
+	})
+
+	t.Run("authenticated 401 and 403 preserve existing errors without misleading not-authenticated prefix", func(t *testing.T) {
+		t.Parallel()
+
+		cases := []struct {
+			name       string
+			statusCode int
+			apiMessage string
+		}{
+			{
+				name:       "HTTP 401 Bad credentials",
+				statusCode: http.StatusUnauthorized,
+				apiMessage: "Bad credentials",
+			},
+			{
+				name:       "HTTP 403 Resource not accessible by integration",
+				statusCode: http.StatusForbidden,
+				apiMessage: "Resource not accessible by integration",
+			},
+		}
+
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal(t, "Bearer ghp_test", r.Header.Get("Authorization"))
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(tc.statusCode)
+					_ = json.NewEncoder(w).Encode(map[string]any{"message": tc.apiMessage})
+				}))
+				t.Cleanup(srv.Close)
+
+				p := newProvider()
+				p.allowPrivateIPs = true
+
+				stepToken := "ghp_test" //nolint:gosec // synthetic test credential
+				authCtx, err := withRequestAuthOverride(context.Background(), map[string]any{"token": stepToken})
+				require.NoError(t, err)
+
+				_, gqlErr := graphqlDo(authCtx, p.getClient(), srv.URL, "query { viewer { login } }", nil)
+				require.Error(t, gqlErr)
+				assert.EqualError(t, gqlErr, fmt.Sprintf("GitHub GraphQL API error (HTTP %d): %s", tc.statusCode, tc.apiMessage))
+				assert.NotContains(t, gqlErr.Error(), "not authenticated with GitHub")
+
+				_, restErr := p.doRESTRequest(authCtx, p.getClient(), http.MethodGet, srv.URL+"/repos/public-org/demo/labels", nil)
+				require.Error(t, restErr)
+				assert.EqualError(t, restErr, fmt.Sprintf("GitHub API error (HTTP %d): %s", tc.statusCode, tc.apiMessage))
+				assert.NotContains(t, restErr.Error(), "not authenticated with GitHub")
+
+				var re *restError
+				require.ErrorAs(t, restErr, &re)
+				assert.Equal(t, tc.statusCode, re.StatusCode)
+			})
+		}
+	})
+
+	t.Run("custom WithClient injecting Authorization header preserves existing 403 error on GraphQL and REST", func(t *testing.T) {
+		t.Parallel()
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "Bearer custom-hook-val", r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "SSO authorization required"})
+		}))
+		t.Cleanup(srv.Close)
+
+		svc, unauthHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{Error: "not logged in"}, nil
+		})
+		ctx := sdkplugin.WithHostClient(context.Background(), unauthHC)
+
+		customClient := httpc.NewClient(&httpc.ClientConfig{
+			EnableCache: false,
+			RetryMax:    0,
+			IPPolicy:    httpc.AllowAllPrivateIPs(),
+			RequestHooks: []httpc.RequestHook{
+				func(req *http.Request) error {
+					req.Header.Set("Authorization", "Bearer custom-hook-val")
+					return nil
+				},
+			},
+		})
+		t.Cleanup(func() { _ = customClient.Close() })
+
+		p := newProvider(WithClient(customClient))
+		_, gqlErr := p.execute(ctx, map[string]any{
+			"operation": "get_repo",
+			"owner":     "org",
+			"repo":      "repo",
+			"api_base":  srv.URL,
+		})
+		require.Error(t, gqlErr)
+		assert.EqualError(t, gqlErr, "github: GitHub GraphQL API error (HTTP 403): SSO authorization required")
+		assert.NotContains(t, gqlErr.Error(), "not authenticated with GitHub")
+
+		_, err := p.doRESTRequest(ctx, customClient, http.MethodGet, srv.URL+"/repos/org/repo", nil)
+		require.Error(t, err)
+		assert.EqualError(t, err, "GitHub API error (HTTP 403): SSO authorization required")
+		assert.NotContains(t, err.Error(), "not authenticated with GitHub")
+		assert.Empty(t, svc.getRequests())
+	})
+
+	t.Run("custom WithClient without auth hook adds guidance on GraphQL 401 even when host client is unauthenticated", func(t *testing.T) {
+		t.Parallel()
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Empty(t, r.Header.Get("Authorization"))
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Requires authentication"})
+		}))
+		t.Cleanup(srv.Close)
+
+		svc, unauthHC := startTestAuthHostClient(t, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+			return &proto.GetAuthTokenResponse{Error: "not logged in"}, nil
+		})
+		ctx := sdkplugin.WithHostClient(context.Background(), unauthHC)
+
+		customClient := httpc.NewClient(&httpc.ClientConfig{
+			EnableCache: false,
+			RetryMax:    0,
+			IPPolicy:    httpc.AllowAllPrivateIPs(),
+		})
+		t.Cleanup(func() { _ = customClient.Close() })
+
+		p := newProvider(WithClient(customClient))
+		_, err := p.execute(ctx, map[string]any{
+			"operation": "get_repo",
+			"owner":     "org",
+			"repo":      "repo",
+			"api_base":  srv.URL,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not authenticated with GitHub (HTTP 401): run 'scafctl auth login github', set GITHUB_TOKEN, or pass 'token'")
+		assert.Contains(t, err.Error(), "Requires authentication")
+		assert.Empty(t, svc.getRequests())
+	})
+
+	t.Run("cross-origin redirect 403 does not misreport external storage error as GitHub auth failure", func(t *testing.T) {
+		t.Parallel()
+
+		blobSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "ExpiredBlobSignature"})
+		}))
+		t.Cleanup(blobSrv.Close)
+
+		apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, blobSrv.URL+"/logs.txt", http.StatusFound)
+		}))
+		t.Cleanup(apiSrv.Close)
+
+		customClient := httpc.NewClient(&httpc.ClientConfig{
+			EnableCache: false,
+			RetryMax:    0,
+			IPPolicy:    httpc.AllowAllPrivateIPs(),
+		})
+		t.Cleanup(func() { _ = customClient.Close() })
+
+		p := newProvider(WithClient(customClient))
+		_, err := p.execute(context.Background(), map[string]any{
+			"operation": "get_job_logs",
+			"owner":     "public-org",
+			"repo":      "demo",
+			"job_id":    55,
+			"api_base":  apiSrv.URL,
+		})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "ExpiredBlobSignature")
+		assert.NotContains(t, err.Error(), "not authenticated with GitHub")
+	})
+}
+
+func BenchmarkGraphQLDo_UnauthenticatedPreFlight(b *testing.B) {
+	_, hc := startTestAuthHostClient(b, func(_ *proto.GetAuthTokenRequest) (*proto.GetAuthTokenResponse, error) {
+		return &proto.GetAuthTokenResponse{Error: "not logged in"}, nil
+	})
+
+	p := newProvider()
+	p.allowPrivateIPs = true
+	client := p.getClient()
+	ctx := sdkplugin.WithHostClient(context.Background(), hc)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		_, _ = graphqlDo(ctx, client, "https://api.github.com", "query { viewer { login } }", nil)
 	}
 }
