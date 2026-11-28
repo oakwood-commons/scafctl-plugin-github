@@ -75,7 +75,7 @@ var allOperations = []string{
 	"get_repo", "get_file",
 	"list_releases", "get_latest_release",
 	"list_pull_requests", "get_pull_request",
-	"list_issues", "get_issue", "list_issue_comments",
+	"list_issues", "get_issue", "list_issue_comments", "list_issue_timeline",
 	"list_branches", "get_branch", "list_tags",
 	"list_pr_comments",
 	// Review thread & PR review operations
@@ -127,7 +127,7 @@ var readOperations = map[string]bool{
 	"get_repo": true, "get_file": true,
 	"list_releases": true, "get_latest_release": true,
 	"list_pull_requests": true, "get_pull_request": true,
-	"list_issues": true, "get_issue": true, "list_issue_comments": true,
+	"list_issues": true, "get_issue": true, "list_issue_comments": true, "list_issue_timeline": true,
 	"list_branches": true, "get_branch": true, "list_tags": true,
 	"get_head_oid":        true,
 	"list_pr_comments":    true,
@@ -529,6 +529,8 @@ func (p *Provider) execute(ctx context.Context, inputs map[string]any) (*sdkprov
 		result, err = p.executeGetIssue(ctx, client, apiBase, owner, repo, inputs)
 	case "list_issue_comments":
 		result, err = p.executeListIssueComments(ctx, client, apiBase, owner, repo, inputs)
+	case "list_issue_timeline":
+		result, err = p.executeListIssueTimeline(ctx, client, apiBase, owner, repo, inputs)
 	case "list_pr_comments":
 		result, err = p.executeListPRComments(ctx, client, apiBase, owner, repo, inputs)
 	case "list_branches":
@@ -937,15 +939,22 @@ func (e *restError) Error() string {
 
 // doRESTRequest performs an authenticated REST API request and returns the parsed JSON.
 func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, method, url string, body any) (any, error) {
+	result, _, err := p.doRESTRequestWithHeaders(ctx, client, method, url, body)
+	return result, err
+}
+
+// doRESTRequestWithHeaders performs an authenticated REST API request and returns
+// both the parsed JSON payload and the HTTP response headers.
+func (p *Provider) doRESTRequestWithHeaders(ctx context.Context, client *httpc.Client, method, url string, body any) (any, http.Header, error) {
 	if client == nil {
-		return nil, fmt.Errorf("HTTP client is not initialized")
+		return nil, nil, fmt.Errorf("HTTP client is not initialized")
 	}
 
 	var bodyReader io.Reader
 	if body != nil {
 		bodyBytes, err := json.Marshal(body)
 		if err != nil {
-			return nil, fmt.Errorf("marshaling request body: %w", err)
+			return nil, nil, fmt.Errorf("marshaling request body: %w", err)
 		}
 		bodyReader = bytes.NewReader(bodyBytes)
 	}
@@ -953,7 +962,7 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 	requestCtx, _ := withRequestAuthState(ctx)
 	req, err := http.NewRequestWithContext(requestCtx, method, url, bodyReader)
 	if err != nil {
-		return nil, fmt.Errorf("creating REST request: %w", err)
+		return nil, nil, fmt.Errorf("creating REST request: %w", err)
 	}
 
 	req.Header.Set("Accept", "application/vnd.github+json")
@@ -967,12 +976,12 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 		defer resp.Body.Close() //nolint:errcheck // best-effort close
 	}
 	if err != nil {
-		return nil, fmt.Errorf("REST request failed: %w", redactURLErrorQuery(err))
+		return nil, nil, fmt.Errorf("REST request failed: %w", redactURLErrorQuery(err))
 	}
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading REST response: %w", err)
+		return nil, nil, fmt.Errorf("reading REST response: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
@@ -985,22 +994,22 @@ func (p *Provider) doRESTRequest(ctx context.Context, client *httpc.Client, meth
 		}
 		re := &restError{StatusCode: resp.StatusCode, Message: msg}
 		if shouldAddUnauthenticatedHint(requestCtx, req, resp) {
-			return nil, wrapUnauthenticatedHTTPError(resp.StatusCode, re)
+			return nil, resp.Header, wrapUnauthenticatedHTTPError(resp.StatusCode, re)
 		}
-		return nil, re
+		return nil, resp.Header, re
 	}
 
 	// DELETE with 204 No Content
 	if resp.StatusCode == http.StatusNoContent {
-		return map[string]any{}, nil
+		return map[string]any{}, resp.Header, nil
 	}
 
 	var result any
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("parsing REST response JSON: %w", err)
+		return nil, resp.Header, fmt.Errorf("parsing REST response JSON: %w", err)
 	}
 
-	return result, nil
+	return result, resp.Header, nil
 }
 
 // buildInputSchema constructs the JSON Schema for all GitHub provider operations.
@@ -1009,6 +1018,9 @@ func buildInputSchema() *jsonschema.Schema {
 	for i, op := range allOperations {
 		operationEnums[i] = op
 	}
+	milestoneMin := 1.0
+	milestoneMinLen := 1
+	milestoneMaxLen := 200
 
 	return sdkhelper.ObjectSchema(
 		[]string{"operation"},
@@ -1061,7 +1073,7 @@ func buildInputSchema() *jsonschema.Schema {
 				sdkhelper.WithEnum("open", "closed", "all", "OPEN", "CLOSED", "MERGED"),
 				sdkhelper.WithDefault("open"),
 			),
-			"per_page": sdkhelper.IntProp("Number of results per page (max 100)",
+			"per_page": sdkhelper.IntProp("Number of results per page (max 100; defaults to 30, or 100 for paginated review and timeline operations)",
 				sdkhelper.WithMinimum(1),
 				sdkhelper.WithMaximum(100),
 				sdkhelper.WithDefault(30),
@@ -1074,13 +1086,41 @@ func buildInputSchema() *jsonschema.Schema {
 			"body": sdkhelper.StringProp("Body text for issue, pull request, release, or comment",
 				sdkhelper.WithMaxLength(65536),
 			),
-			"labels": sdkhelper.ArrayProp("Labels to apply (names for issues, IDs resolved internally)",
+			"labels": sdkhelper.ArrayProp("Label names to filter by (for list_issues) or apply (for create_issue, update_issue, add_labels_to_issue)",
 				sdkhelper.WithItems(sdkhelper.StringProp("Label name")),
 				sdkhelper.WithMaxItems(100),
 			),
-			"assignees": sdkhelper.ArrayProp("Assignee login usernames",
+			"assignees": sdkhelper.ArrayProp("Assignee login usernames (for create_issue and update_issue)",
 				sdkhelper.WithItems(sdkhelper.StringProp("Username")),
 				sdkhelper.WithMaxItems(10),
+			),
+			"assignee": sdkhelper.StringProp("Filter issues by assignee username, '*' for any assigned user, or 'none' for unassigned issues (for list_issues)",
+				sdkhelper.WithMaxLength(200),
+			),
+			"milestone": {
+				Description: "Filter issues by milestone title, milestone number, '*' for any milestone, or 'none' for issues without a milestone (for list_issues)",
+				Types:       []string{"string", "integer"},
+				Minimum:     &milestoneMin,
+				MinLength:   &milestoneMinLen,
+				MaxLength:   &milestoneMaxLen,
+			},
+			"creator": sdkhelper.StringProp("Filter issues by creator username (for list_issues)",
+				sdkhelper.WithMaxLength(200),
+			),
+			"mentioned": sdkhelper.StringProp("Filter issues mentioning a username (for list_issues)",
+				sdkhelper.WithMaxLength(200),
+			),
+			"since": sdkhelper.StringProp("Filter issues updated at or after an ISO 8601 timestamp (for list_issues)",
+				sdkhelper.WithFormat("date-time"),
+				sdkhelper.WithMaxLength(100),
+			),
+			"sort": sdkhelper.StringProp("Sort field for list_issues",
+				sdkhelper.WithEnum("created", "updated", "comments", "created_at", "updated_at", "CREATED_AT", "UPDATED_AT", "COMMENTS"),
+				sdkhelper.WithDefault("created"),
+			),
+			"direction": sdkhelper.StringProp("Sort direction for list_issues",
+				sdkhelper.WithEnum("asc", "desc", "ASC", "DESC"),
+				sdkhelper.WithDefault("desc"),
 			),
 			"state_reason": sdkhelper.StringProp("Reason for closing an issue (for update_issue with state=closed)",
 				sdkhelper.WithEnum("completed", "not_planned", "reopened"),
@@ -1109,10 +1149,10 @@ func buildInputSchema() *jsonschema.Schema {
 			),
 
 			// --- PR fields ---
-			"head": sdkhelper.StringProp("Head branch name for creating a pull request",
-				sdkhelper.WithMaxLength(200),
+			"head": sdkhelper.StringProp("Head branch name for creating or filtering pull requests (list_pull_requests also accepts owner:branch)",
+				sdkhelper.WithMaxLength(300),
 			),
-			"base": sdkhelper.StringProp("Base branch name for creating/updating a pull request",
+			"base": sdkhelper.StringProp("Base branch name for creating, updating, or filtering pull requests",
 				sdkhelper.WithMaxLength(200),
 			),
 			"draft": sdkhelper.BoolProp("Whether the pull request is a draft (for create_pull_request and update_pull_request)"),
@@ -1120,8 +1160,8 @@ func buildInputSchema() *jsonschema.Schema {
 				sdkhelper.WithItems(sdkhelper.StringProp("Team slug")),
 				sdkhelper.WithMaxItems(100),
 			),
-			"bot_ids": sdkhelper.ArrayProp("Bot GraphQL node IDs to request pull request reviews from (for request_reviewers)",
-				sdkhelper.WithItems(sdkhelper.StringProp("Bot node ID")),
+			"bot_ids": sdkhelper.ArrayProp("Bot GraphQL node IDs (or '@copilot' alias) to request pull request reviews from (for request_reviewers)",
+				sdkhelper.WithItems(sdkhelper.StringProp("Bot node ID or alias")),
 				sdkhelper.WithMaxItems(100),
 			),
 			"merge_method": sdkhelper.StringProp("Merge method for merge_pull_request",
@@ -1290,9 +1330,9 @@ func buildInputSchema() *jsonschema.Schema {
 			// --- Environment fields ---
 			"environment_name": sdkhelper.StringProp("Deployment environment name", sdkhelper.WithMaxLength(200)),
 			"wait_timer":       sdkhelper.IntProp("Wait timer in minutes before deployments proceed", sdkhelper.WithMinimum(0), sdkhelper.WithMaximum(maxEnvironmentWaitTimer)),
-			"reviewers": sdkhelper.ArrayProp("Reviewer usernames (for request_reviewers) or required reviewer objects (for create_or_update_environment)",
+			"reviewers": sdkhelper.ArrayProp("Reviewer usernames or '@copilot' alias (for request_reviewers), or required reviewer objects (for create_or_update_environment)",
 				sdkhelper.WithItems(&jsonschema.Schema{
-					Description: "Reviewer username string (for request_reviewers) or reviewer object (for create_or_update_environment)",
+					Description: "Reviewer username or '@copilot' alias string (for request_reviewers), or reviewer object (for create_or_update_environment)",
 					Types:       []string{"string", "object"},
 				}),
 				sdkhelper.WithMaxItems(100),
@@ -1394,12 +1434,27 @@ labels:
   - bug`,
 		},
 		{
-			Name:        "List pull requests",
-			Description: "List open pull requests",
+			Name:        "List pull requests for a branch",
+			Description: "List open pull requests filtered by head and base branch",
 			YAML: `operation: list_pull_requests
 owner: my-org
 repo: my-repo
-state: open`,
+state: open
+head: feat/add-config
+base: main`,
+		},
+		{
+			Name:        "List filtered issues",
+			Description: "List open issues filtered server-side by label, assignee, and sort order",
+			YAML: `operation: list_issues
+owner: my-org
+repo: my-repo
+state: open
+labels:
+  - bug
+assignee: octocat
+sort: updated
+direction: desc`,
 		},
 		{
 			Name:        "Generic API call",
@@ -1452,18 +1507,25 @@ repo: my-repo
 number: 42`,
 		},
 		{
+			Name:        "List issue or pull request timeline events",
+			Description: "Fetch paginated timeline events for an issue or pull request",
+			YAML: `operation: list_issue_timeline
+owner: my-org
+repo: my-repo
+number: 42`,
+		},
+		{
 			Name:        "Request pull request reviewers",
-			Description: "Request human, team, and bot reviewers on an open pull request",
+			Description: "Request human, team, and Copilot reviewers on an open pull request",
 			YAML: `operation: request_reviewers
 owner: my-org
 repo: my-repo
 number: 42
 reviewers:
   - octocat
+  - "@copilot"
 team_reviewers:
-  - platform-reviewers
-bot_ids:
-  - BOT_kgDOCnlnWA`,
+  - platform-reviewers`,
 		},
 		{
 			Name:        "Fetch failed job logs with per-step auth profile",

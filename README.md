@@ -13,7 +13,7 @@ A [scafctl](https://github.com/oakwood-commons/scafctl) plugin that provides the
 ## Supported Operations
 
 ### Read Operations
-`get_repo`, `get_file`, `list_releases`, `get_latest_release`, `list_pull_requests`, `get_pull_request`, `list_issues`, `get_issue`, `list_issue_comments`, `list_branches`, `get_branch`, `list_tags`, `get_head_oid`, `list_pr_comments`, `list_review_threads`, `list_pr_reviews`, `list_check_runs`, `get_workflow_run`, `get_job_logs`, `list_commit_pulls`, `list_labels`, `list_milestones`, `list_reactions`, `list_collaborators`, `list_webhooks`, `list_workflow_runs`, `list_repo_variables`, `list_environments`, `list_topics`, `list_custom_properties`
+`get_repo`, `get_file`, `list_releases`, `get_latest_release`, `list_pull_requests`, `get_pull_request`, `list_issues`, `get_issue`, `list_issue_comments`, `list_issue_timeline`, `list_branches`, `get_branch`, `list_tags`, `get_head_oid`, `list_pr_comments`, `list_review_threads`, `list_pr_reviews`, `list_check_runs`, `get_workflow_run`, `get_job_logs`, `list_commit_pulls`, `list_labels`, `list_milestones`, `list_reactions`, `list_collaborators`, `list_webhooks`, `list_workflow_runs`, `list_repo_variables`, `list_environments`, `list_topics`, `list_custom_properties`
 
 ### Write Operations
 `create_issue`, `update_issue`, `create_issue_comment`, `create_pull_request`, `update_pull_request`, `merge_pull_request`, `close_pull_request`, `request_reviewers`, `create_commit`, `create_branch`, `delete_branch`, `create_tag`, `delete_tag`, `create_release`, `update_release`, `delete_release`, `create_repo`, `update_repo`, `create_ruleset`, `enable_vulnerability_alerts`, `enable_automated_security_fixes`, `create_label`, `update_label`, `delete_label`, `add_labels_to_issue`, `remove_label_from_issue`, `create_milestone`, `update_milestone`, `delete_milestone`, `add_reaction`, `delete_reaction`, `add_collaborator`, `remove_collaborator`, `create_webhook`, `update_webhook`, `delete_webhook`, `dispatch_workflow`, `cancel_workflow_run`, `rerun_workflow`, `create_or_update_variable`, `delete_variable`, `create_or_update_environment`, `delete_environment`, `replace_topics`, `fork_repo`, `create_from_template`, `set_custom_properties`, `reply_to_review_thread`, `resolve_review_thread`
@@ -91,7 +91,37 @@ actions:
 ```
 
 ```yaml
-# Snapshot pull request reviews and unresolved review threads
+# Resolve open pull request for a branch and list filtered issues
+resolvers:
+  branch-pr:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: list_pull_requests
+            owner: my-org
+            repo: my-repo
+            state: open
+            head: feat/add-config
+            base: main
+  triaged-bugs:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: list_issues
+            owner: my-org
+            repo: my-repo
+            state: open
+            labels:
+              - bug
+            assignee: octocat
+            sort: updated
+            direction: desc
+```
+
+```yaml
+# Snapshot pull request reviews, timeline events, and unresolved review threads
 resolvers:
   pr-reviews:
     resolve:
@@ -99,6 +129,15 @@ resolvers:
         - provider: github
           inputs:
             operation: list_pr_reviews
+            owner: my-org
+            repo: my-repo
+            number: 42
+  pr-timeline:
+    resolve:
+      with:
+        - provider: github
+          inputs:
+            operation: list_issue_timeline
             owner: my-org
             repo: my-repo
             number: 42
@@ -130,7 +169,7 @@ resolvers:
 ```
 
 ```yaml
-# Mark a pull request ready for review and request human, team, and bot reviewers
+# Mark a pull request ready for review and request human, team, and Copilot reviewers
 actions:
   - provider: github
     inputs:
@@ -147,10 +186,9 @@ actions:
       number: 42
       reviewers:
         - octocat
+        - "@copilot"
       team_reviewers:
         - platform-reviewers
-      bot_ids:
-        - BOT_kgDOCnlnWA
 ```
 
 ```yaml

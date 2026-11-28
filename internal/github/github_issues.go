@@ -6,7 +6,9 @@ package github
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/oakwood-commons/httpc"
 	sdkprovider "github.com/oakwood-commons/scafctl-plugin-sdk/provider"
@@ -403,4 +405,225 @@ func mapIssueStateReason(reason string) (string, error) {
 	default:
 		return "", fmt.Errorf("invalid state_reason %q: must be one of completed, not_planned, reopened", reason)
 	}
+}
+
+// extractOptionalTrimmedString validates that an optional input, if supplied and non-nil,
+// is a string and returns its trimmed value.
+func extractOptionalTrimmedString(inputs map[string]any, operation, key string) (string, error) {
+	raw, exists := inputs[key]
+	if !exists || raw == nil {
+		return "", nil
+	}
+	s, ok := raw.(string)
+	if !ok {
+		return "", fmt.Errorf("%s: '%s' must be a string, got %T", operation, key, raw)
+	}
+	return strings.TrimSpace(s), nil
+}
+
+// mapIssueOrderField converts user-friendly sort names to GitHub GraphQL IssueOrderField values.
+func mapIssueOrderField(sortField string) (string, error) {
+	switch strings.ToLower(sortField) {
+	case "", "created", "created_at":
+		return "CREATED_AT", nil
+	case "updated", "updated_at":
+		return "UPDATED_AT", nil
+	case "comments":
+		return "COMMENTS", nil
+	default:
+		return "", fmt.Errorf("list_issues: invalid 'sort' %q: must be one of created, updated, comments", sortField)
+	}
+}
+
+// mapOrderDirection converts user-friendly direction strings to GitHub GraphQL OrderDirection values.
+func mapOrderDirection(direction string) (string, error) {
+	switch strings.ToLower(direction) {
+	case "", "desc":
+		return "DESC", nil
+	case "asc":
+		return "ASC", nil
+	default:
+		return "", fmt.Errorf("list_issues: invalid 'direction' %q: must be one of asc, desc", direction)
+	}
+}
+
+// buildIssueFilters constructs a GitHub GraphQL IssueFilters map from list_issues inputs.
+// When a milestone title filter does not match any milestone in the repository, emptyMatch
+// is returned as true so the caller can return an empty result slice without an extra query.
+func (p *Provider) buildIssueFilters(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (map[string]any, bool, error) {
+	filterBy := make(map[string]any)
+
+	labels, err := extractStrictStringSlice(inputs, "list_issues", "labels")
+	if err != nil {
+		return nil, false, err
+	}
+	if len(labels) > 0 {
+		filterBy["labels"] = labels
+	}
+
+	assignee, err := extractOptionalTrimmedString(inputs, "list_issues", "assignee")
+	if err != nil {
+		return nil, false, err
+	}
+	if assignee != "" {
+		if strings.EqualFold(assignee, "none") {
+			filterBy["assignee"] = nil
+		} else {
+			filterBy["assignee"] = assignee
+		}
+	}
+
+	creator, err := extractOptionalTrimmedString(inputs, "list_issues", "creator")
+	if err != nil {
+		return nil, false, err
+	}
+	if creator != "" {
+		filterBy["createdBy"] = creator
+	}
+
+	mentioned, err := extractOptionalTrimmedString(inputs, "list_issues", "mentioned")
+	if err != nil {
+		return nil, false, err
+	}
+	if mentioned != "" {
+		filterBy["mentioned"] = mentioned
+	}
+
+	since, err := extractOptionalTrimmedString(inputs, "list_issues", "since")
+	if err != nil {
+		return nil, false, err
+	}
+	if since != "" {
+		if _, parseErr := time.Parse(time.RFC3339Nano, since); parseErr != nil {
+			return nil, false, fmt.Errorf("list_issues: 'since' must be a valid RFC 3339 timestamp: %w", parseErr)
+		}
+		filterBy["since"] = since
+	}
+
+	if rawMilestone, exists := inputs["milestone"]; exists && rawMilestone != nil {
+		switch mVal := rawMilestone.(type) {
+		case string:
+			trimmed := strings.TrimSpace(mVal)
+			if trimmed != "" {
+				switch {
+				case strings.EqualFold(trimmed, "none"):
+					filterBy["milestoneNumber"] = nil
+				case trimmed == "*":
+					filterBy["milestoneNumber"] = "*"
+				default:
+					if parsedNum, parseErr := strconv.Atoi(trimmed); parseErr == nil {
+						if parsedNum < 1 {
+							return nil, false, fmt.Errorf("list_issues: 'milestone' number must be >= 1, got %q", trimmed)
+						}
+						filterBy["milestoneNumber"] = strconv.Itoa(parsedNum)
+					} else {
+						resolvedNum, found, resolveErr := p.resolveMilestoneNumberByTitle(ctx, client, apiBase, owner, repo, trimmed)
+						if resolveErr != nil {
+							return nil, false, resolveErr
+						}
+						if !found {
+							return nil, true, nil
+						}
+						filterBy["milestoneNumber"] = strconv.Itoa(resolvedNum)
+					}
+				}
+			}
+		default:
+			num, ok := getIntInput(inputs, "milestone")
+			if !ok {
+				return nil, false, fmt.Errorf("list_issues: 'milestone' must be a string or integer, got %T", rawMilestone)
+			}
+			if num < 1 {
+				return nil, false, fmt.Errorf("list_issues: 'milestone' number must be >= 1, got %d", num)
+			}
+			filterBy["milestoneNumber"] = strconv.Itoa(num)
+		}
+	}
+
+	return filterBy, false, nil
+}
+
+// resolveMilestoneNumberByTitle resolves a milestone's integer number from its title.
+func (p *Provider) resolveMilestoneNumberByTitle(ctx context.Context, client *httpc.Client, apiBase, owner, repo, title string) (int, bool, error) {
+	query := `query($owner: String!, $name: String!, $first: Int!, $after: String, $query: String!) {
+  repository(owner: $owner, name: $name) {
+    milestones(first: $first, after: $after, query: $query) {
+      nodes {
+        number
+        title
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}`
+	var after string
+	var fallbackNum int
+
+	for page := 0; page < maxGraphQLPaginationPages; page++ {
+		vars := map[string]any{
+			"owner": owner,
+			"name":  repo,
+			"first": defaultGraphQLPageSize,
+			"query": title,
+		}
+		if after != "" {
+			vars["after"] = after
+		}
+
+		data, err := graphqlDo(ctx, client, apiBase, query, vars)
+		if err != nil {
+			return 0, false, fmt.Errorf("resolving milestone %q: %w", title, err)
+		}
+
+		conn, err := extractNodeMap(data, "repository.milestones")
+		if err != nil {
+			return 0, false, fmt.Errorf("resolving milestone %q: %w", title, err)
+		}
+		rawNodes, ok := conn["nodes"]
+		if !ok {
+			return 0, false, fmt.Errorf("resolving milestone %q: key %q has no 'nodes' field", title, "repository.milestones")
+		}
+		nodes, ok := rawNodes.([]any)
+		if !ok {
+			return 0, false, fmt.Errorf("resolving milestone %q: 'nodes' at %q is not an array", title, "repository.milestones")
+		}
+
+		for _, n := range nodes {
+			m, isMap := n.(map[string]any)
+			if !isMap {
+				continue
+			}
+			num, ok := getIntInput(m, "number")
+			if !ok || num < 1 {
+				continue
+			}
+			nodeTitle, _ := m["title"].(string)
+			if nodeTitle == title {
+				return num, true, nil
+			}
+			if fallbackNum == 0 && strings.EqualFold(nodeTitle, title) {
+				fallbackNum = num
+			}
+		}
+
+		hasNext, endCursor := extractPageInfo(conn)
+		if !hasNext {
+			break
+		}
+		if endCursor == "" {
+			return 0, false, fmt.Errorf("resolving milestone %q: hasNextPage is true with empty endCursor", title)
+		}
+		if page == maxGraphQLPaginationPages-1 {
+			return 0, false, fmt.Errorf("resolving milestone %q: exceeded pagination safety limit (%d pages)", title, maxGraphQLPaginationPages)
+		}
+		after = endCursor
+	}
+
+	if fallbackNum > 0 {
+		return fallbackNum, true, nil
+	}
+	return 0, false, nil
 }
