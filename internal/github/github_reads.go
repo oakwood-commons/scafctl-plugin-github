@@ -204,9 +204,31 @@ func (p *Provider) executeListPullRequests(ctx context.Context, client *httpc.Cl
 	perPage := getPerPage(inputs)
 	state := mapPRState(getStringInput(inputs, "state"))
 
-	query := `query($owner: String!, $name: String!, $first: Int!, $states: [PullRequestState!]) {
+	head, err := extractOptionalTrimmedString(inputs, "list_pull_requests", "head")
+	if err != nil {
+		return nil, err
+	}
+	base, err := extractOptionalTrimmedString(inputs, "list_pull_requests", "base")
+	if err != nil {
+		return nil, err
+	}
+
+	var headOwner, headBranch string
+	if head != "" {
+		if idx := strings.IndexByte(head, ':'); idx >= 0 {
+			headOwner = strings.TrimSpace(head[:idx])
+			headBranch = strings.TrimSpace(head[idx+1:])
+			if headBranch == "" {
+				return nil, fmt.Errorf("list_pull_requests: 'head' branch name cannot be empty in %q", head)
+			}
+		} else {
+			headBranch = head
+		}
+	}
+
+	query := `query($owner: String!, $name: String!, $first: Int!, $after: String, $states: [PullRequestState!], $head: String, $base: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(first: $first, states: $states, orderBy: {field: CREATED_AT, direction: DESC}) {
+    pullRequests(first: $first, after: $after, states: $states, headRefName: $head, baseRefName: $base, orderBy: {field: CREATED_AT, direction: DESC}) {
       nodes {
         number
         title
@@ -218,30 +240,129 @@ func (p *Provider) executeListPullRequests(ctx context.Context, client *httpc.Cl
         author { login }
         headRefName
         baseRefName
+        headRepository { owner { login } }
+        headRepositoryOwner { login }
         isDraft
         mergeable
         additions
         deletions
         changedFiles
       }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
     }
   }
 }`
-	vars := map[string]any{"owner": owner, "name": repo, "first": perPage}
-	if state != nil {
-		vars["states"] = state
+
+	if headOwner == "" {
+		vars := map[string]any{"owner": owner, "name": repo, "first": min(perPage, defaultGraphQLPageSize)}
+		if state != nil {
+			vars["states"] = state
+		}
+		if headBranch != "" {
+			vars["head"] = headBranch
+		}
+		if base != "" {
+			vars["base"] = base
+		}
+
+		data, err := graphqlDo(ctx, client, apiBase, query, vars)
+		if err != nil {
+			return nil, err
+		}
+
+		nodes, err := extractNodes(data, "repository.pullRequests")
+		if err != nil {
+			return nil, err
+		}
+		return readOutput(nodes), nil
 	}
 
-	data, err := graphqlDo(ctx, client, apiBase, query, vars)
-	if err != nil {
-		return nil, err
+	filtered := make([]any, 0, min(perPage, defaultGraphQLPageSize))
+	var after string
+
+	for page := 0; page < maxGraphQLPaginationPages; page++ {
+		vars := map[string]any{
+			"owner": owner,
+			"name":  repo,
+			"first": defaultGraphQLPageSize,
+		}
+		if after != "" {
+			vars["after"] = after
+		}
+		if state != nil {
+			vars["states"] = state
+		}
+		if headBranch != "" {
+			vars["head"] = headBranch
+		}
+		if base != "" {
+			vars["base"] = base
+		}
+
+		data, err := graphqlDo(ctx, client, apiBase, query, vars)
+		if err != nil {
+			return nil, err
+		}
+
+		conn, err := extractNodeMap(data, "repository.pullRequests")
+		if err != nil {
+			return nil, err
+		}
+		rawNodes, ok := conn["nodes"]
+		if !ok {
+			return nil, fmt.Errorf("key %q has no 'nodes' field", "repository.pullRequests")
+		}
+		pageNodes, ok := rawNodes.([]any)
+		if !ok {
+			return nil, fmt.Errorf("'nodes' at %q is not an array", "repository.pullRequests")
+		}
+
+		for _, n := range pageNodes {
+			nm, isMap := n.(map[string]any)
+			if !isMap {
+				continue
+			}
+			if strings.EqualFold(extractHeadRepoOwner(nm), headOwner) {
+				filtered = append(filtered, n)
+				if len(filtered) >= perPage {
+					return readOutput(filtered[:perPage]), nil
+				}
+			}
+		}
+
+		hasNext, endCursor := extractPageInfo(conn)
+		if !hasNext {
+			break
+		}
+		if endCursor == "" {
+			return nil, fmt.Errorf("list_pull_requests pagination: hasNextPage is true with empty endCursor")
+		}
+		if page == maxGraphQLPaginationPages-1 {
+			return nil, fmt.Errorf("list_pull_requests: exceeded pagination safety limit (%d pages)", maxGraphQLPaginationPages)
+		}
+		after = endCursor
 	}
 
-	nodes, err := extractNodes(data, "repository.pullRequests")
-	if err != nil {
-		return nil, err
+	return readOutput(filtered), nil
+}
+
+func extractHeadRepoOwner(prNode map[string]any) string {
+	if hr, ok := prNode["headRepository"].(map[string]any); ok {
+		if ownerMap, ok := hr["owner"].(map[string]any); ok {
+			if login, _ := ownerMap["login"].(string); login != "" {
+				return login
+			}
+		}
 	}
-	return readOutput(nodes), nil
+	if hro, ok := prNode["headRepositoryOwner"].(map[string]any); ok {
+		if login, _ := hro["login"].(string); login != "" {
+			return login
+		}
+	}
+	return ""
 }
 
 func (p *Provider) executeGetPullRequest(ctx context.Context, client *httpc.Client, apiBase, owner, repo string, inputs map[string]any) (*sdkprovider.Output, error) {
@@ -344,9 +465,35 @@ func (p *Provider) executeListIssues(ctx context.Context, client *httpc.Client, 
 	perPage := getPerPage(inputs)
 	state := mapIssueState(getStringInput(inputs, "state"))
 
-	query := `query($owner: String!, $name: String!, $first: Int!, $states: [IssueState!]) {
+	sortStr, err := extractOptionalTrimmedString(inputs, "list_issues", "sort")
+	if err != nil {
+		return nil, err
+	}
+	orderField, err := mapIssueOrderField(sortStr)
+	if err != nil {
+		return nil, err
+	}
+
+	dirStr, err := extractOptionalTrimmedString(inputs, "list_issues", "direction")
+	if err != nil {
+		return nil, err
+	}
+	orderDirection, err := mapOrderDirection(dirStr)
+	if err != nil {
+		return nil, err
+	}
+
+	filterBy, emptyMatch, err := p.buildIssueFilters(ctx, client, apiBase, owner, repo, inputs)
+	if err != nil {
+		return nil, err
+	}
+	if emptyMatch {
+		return readOutput([]any{}), nil
+	}
+
+	query := `query($owner: String!, $name: String!, $first: Int!, $states: [IssueState!], $filterBy: IssueFilters, $orderField: IssueOrderField!, $orderDirection: OrderDirection!) {
   repository(owner: $owner, name: $name) {
-    issues(first: $first, states: $states, orderBy: {field: CREATED_AT, direction: DESC}) {
+    issues(first: $first, states: $states, filterBy: $filterBy, orderBy: {field: $orderField, direction: $orderDirection}) {
       nodes {
         number
         title
@@ -357,6 +504,7 @@ func (p *Provider) executeListIssues(ctx context.Context, client *httpc.Client, 
         updatedAt
         closedAt
         author { login }
+        milestone { title number }
         labels(first: 20) { nodes { name color } }
         assignees(first: 10) { nodes { login } }
         comments { totalCount }
@@ -364,9 +512,18 @@ func (p *Provider) executeListIssues(ctx context.Context, client *httpc.Client, 
     }
   }
 }`
-	vars := map[string]any{"owner": owner, "name": repo, "first": perPage}
+	vars := map[string]any{
+		"owner":          owner,
+		"name":           repo,
+		"first":          min(perPage, defaultGraphQLPageSize),
+		"orderField":     orderField,
+		"orderDirection": orderDirection,
+	}
 	if state != nil {
 		vars["states"] = state
+	}
+	if len(filterBy) > 0 {
+		vars["filterBy"] = filterBy
 	}
 
 	data, err := graphqlDo(ctx, client, apiBase, query, vars)
